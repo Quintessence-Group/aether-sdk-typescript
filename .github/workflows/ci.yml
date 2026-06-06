@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify dependency signatures
+        run: npm audit signatures
+
+      - name: Lint (type-check)
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Validate package (publint + attw)
+        run: npm run check:packaging
+
+      - name: Inspect tarball contents
+        run: |
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e "const f=require('/tmp/pack.json')[0].files.map(x=>x.path); console.log(f.join('\n')); if (f.some(p=>/ 2\.|^src\/|\.test\./.test(p))) { console.error('::error::Unexpected files in package tarball'); process.exit(1); }"
