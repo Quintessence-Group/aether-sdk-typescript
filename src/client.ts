@@ -541,6 +541,9 @@ export class AetherClient {
    * @param k - Maximum number of results to return. Defaults to `5`.
    * @param options - Retrieval options.
    * @param options.tags - Filter results to documents matching these tags.
+   * @param options.maxDistance - Optional cosine-distance ceiling. Results with
+   *   `distance > maxDistance` are dropped server-side, after reranking. Omit to
+   *   return the top-k regardless of distance (the historical behavior).
    * @returns Deduplicated search results with full document content attached.
    * @throws {AetherError} If query is empty or k is less than 1.
    * @throws {AetherApiError} On non-2xx API response.
@@ -549,11 +552,15 @@ export class AetherClient {
   async retrieve(
     query: string,
     k: number = 5,
-    options?: { tags?: string[] },
+    options?: { tags?: string[]; maxDistance?: number },
   ): Promise<RetrievalResult[]> {
     if (!query) throw new AetherError("query is required");
     if (k < 1) throw new AetherError("k must be at least 1");
-    const results = await this.search(query, k, { includeContent: true, tags: options?.tags });
+    const results = await this.search(query, k, {
+      includeContent: true,
+      tags: options?.tags,
+      maxDistance: options?.maxDistance,
+    });
 
     // Deduplicate by doc_id, keeping the closest match
     const seen = new Map<string, SearchResult>();
@@ -656,6 +663,10 @@ export class AetherClient {
    * @param options - Search options.
    * @param options.includeContent - When `true`, include document/passage content in results.
    * @param options.tags - Filter results to documents matching these tags.
+   * @param options.maxDistance - Optional cosine-distance ceiling. Results with
+   *   `distance > maxDistance` are dropped server-side, after reranking. Smaller
+   *   = stricter (0.0 = exact match, ~1.0 = unrelated). Omit to return the
+   *   top-k regardless of distance (the historical behavior).
    * @returns Array of search results ordered by similarity (closest first).
    * @throws {AetherError} If query is empty or k is less than 1.
    * @throws {AetherApiError} On non-2xx API response.
@@ -664,7 +675,7 @@ export class AetherClient {
   async search(
     query: string,
     k: number = 10,
-    options?: { includeContent?: boolean; tags?: string[] },
+    options?: { includeContent?: boolean; tags?: string[]; maxDistance?: number },
   ): Promise<SearchResult[]> {
     if (!query) throw new AetherError("query is required");
     if (k < 1) throw new AetherError("k must be at least 1");
@@ -674,6 +685,9 @@ export class AetherClient {
     }
     if (options?.tags && options.tags.length > 0) {
       params.set("tags", options.tags.join(","));
+    }
+    if (options?.maxDistance != null) {
+      params.set("max_distance", String(options.maxDistance));
     }
     const body = await this._request<{
       query: string;
@@ -735,6 +749,7 @@ export class AetherClient {
    * @param options - Search options.
    * @param options.includeContent - When `true`, include document/passage content in results.
    * @param options.tags - Filter results to documents matching these tags.
+   * @param options.maxDistance - Optional cosine-distance ceiling. See {@link search}.
    * @returns Array of search results ordered by similarity (closest first).
    * @throws {AetherError} If embedding is empty or k is less than 1.
    * @throws {AetherApiError} On non-2xx API response.
@@ -743,7 +758,7 @@ export class AetherClient {
   async searchByVector(
     embedding: number[],
     k: number = 10,
-    options?: { includeContent?: boolean; tags?: string[] },
+    options?: { includeContent?: boolean; tags?: string[]; maxDistance?: number },
   ): Promise<SearchResult[]> {
     if (!embedding || embedding.length === 0) throw new AetherError("embedding must be a non-empty array");
     if (k < 1) throw new AetherError("k must be at least 1");
@@ -758,6 +773,7 @@ export class AetherClient {
         k,
         include_content: options?.includeContent ?? false,
         tags: options?.tags,
+        max_distance: options?.maxDistance,
       }),
     });
     return body.results;
