@@ -28,10 +28,7 @@
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
     "check:packaging": "publint --strict && attw --pack .",
-    "prepublishOnly": "npm run build && npm run check:packaging",
-    "changeset": "changeset",
-    "version-packages": "changeset version",
-    "release": "changeset publish"
+    "prepublishOnly": "npm run build && npm run check:packaging"
   },
   "license": "MIT",
   "author": "Aether Contributors",
@@ -59,7 +56,6 @@
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.3",
-    "@changesets/cli": "^2.31.0",
     "@types/node": "^25.5.2",
     "publint": "^0.3.21",
     "tsup": "^8.0.0",
