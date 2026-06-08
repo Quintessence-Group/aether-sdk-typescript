@@ -919,7 +919,10 @@ export class AetherClient {
       throw new AetherError("overlap must be non-negative");
     }
     const payload = {
-      documents,
+      documents: documents.map((doc) => ({
+        ...doc,
+        tags: doc.tags && doc.tags.length > 0 ? doc.tags.join(",") : undefined,
+      })),
       chunk_size: options?.chunking?.chunkSize,
       overlap: options?.chunking?.overlap,
     };
@@ -953,7 +956,12 @@ export class AetherClient {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ queries }),
+        body: JSON.stringify({
+          queries: queries.map((query) => ({
+            ...query,
+            tags: query.tags && query.tags.length > 0 ? query.tags.join(",") : undefined,
+          })),
+        }),
       },
     );
     return res.results;
