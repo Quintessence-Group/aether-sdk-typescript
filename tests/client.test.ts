@@ -540,6 +540,29 @@ describe("AetherClient", () => {
       expect(url).toContain("/documents/batch");
       expect(init.method).toBe("POST");
     });
+
+    it("joins each document's tags into a comma-separated string", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [{ doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1 }],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.batchInsert([{ filename: "a.txt", content: "hello", tags: ["x", "y", "z"] }]);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body);
+      // Server's batch deserializer expects tags as a comma-joined string, not an array.
+      expect(body.documents[0].tags).toBe("x,y,z");
+    });
+
+    it("omits tags when none are provided", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [{ doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1 }],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.batchInsert([{ filename: "a.txt", content: "hello" }]);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body);
+      expect(body.documents[0].tags).toBeUndefined();
+    });
   });
 
   describe("batchSearch", () => {
@@ -551,6 +574,17 @@ describe("AetherClient", () => {
       const results = await client.batchSearch([{ q: "test", k: 5 }]);
       expect(results).toHaveLength(1);
       expect(results[0].query).toBe("test");
+    });
+
+    it("joins each query's tags into a comma-separated string", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [{ query: "test", results: [] }],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.batchSearch([{ q: "test", k: 5, tags: ["a", "b"] }]);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body);
+      expect(body.queries[0].tags).toBe("a,b");
     });
   });
 
