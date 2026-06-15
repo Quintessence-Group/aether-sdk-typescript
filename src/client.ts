@@ -27,7 +27,7 @@ function getEnv(key: string): string | undefined {
 }
 
 /** Keep in sync with the version field in package.json. */
-const SDK_VERSION = "0.1.0-rc.1";
+const SDK_VERSION = "0.2.0-rc.1";
 
 /**
  * User-Agent string for outgoing requests, so the server can attribute
