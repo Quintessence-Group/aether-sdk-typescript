@@ -10,6 +10,7 @@ import type {
   BatchSearchResponse,
   ChunkingConfig,
   DocumentRecord,
+  EntityBackfillReport,
   NodeStatus,
   RetrievalResult,
   SearchResult,
@@ -144,6 +145,30 @@ export class AetherClient {
   }
 
   // ── Internal helpers ──────────────────────────────────────────────
+
+  /**
+   * Apply the entity/time-window filter options to a URLSearchParams,
+   * mapping the camelCase SDK options to their snake_case wire names
+   * (`entity_id`, `since`, `until`, `last_n_days`).
+   */
+  private static applyFilterParams(
+    params: URLSearchParams,
+    filters?: { entityId?: string; since?: string; until?: string; lastNDays?: number },
+  ): void {
+    if (!filters) return;
+    if (filters.entityId) {
+      params.set("entity_id", filters.entityId);
+    }
+    if (filters.since) {
+      params.set("since", filters.since);
+    }
+    if (filters.until) {
+      params.set("until", filters.until);
+    }
+    if (filters.lastNDays != null) {
+      params.set("last_n_days", String(filters.lastNDays));
+    }
+  }
 
   private static readonly RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504]);
 
@@ -317,6 +342,7 @@ export class AetherClient {
    * @param options.filename - Filename for the document (required).
    * @param options.contentType - MIME type. Guessed from filename if omitted.
    * @param options.tags - Metadata tags for filtering.
+   * @param options.entityId - Caller-supplied entity to associate the document with.
    * @param options.chunking - Chunking configuration for document splitting.
    * @returns The created document record.
    * @throws {AetherError} If filename is empty or chunking config is invalid.
@@ -325,7 +351,7 @@ export class AetherClient {
    */
   async insert(
     data: Uint8Array,
-    options: { filename: string; contentType?: string; tags?: string[]; chunking?: ChunkingConfig },
+    options: { filename: string; contentType?: string; tags?: string[]; entityId?: string; chunking?: ChunkingConfig },
   ): Promise<DocumentRecord> {
     if (!options.filename) throw new AetherError("filename is required");
     if (options.chunking?.chunkSize !== undefined && options.chunking.chunkSize < 1) {
@@ -341,6 +367,9 @@ export class AetherClient {
     });
     if (options.tags && options.tags.length > 0) {
       params.set("tags", options.tags.join(","));
+    }
+    if (options.entityId) {
+      params.set("entity_id", options.entityId);
     }
     if (options.chunking?.chunkSize) {
       params.set("chunk_size", options.chunking.chunkSize.toString());
@@ -364,13 +393,14 @@ export class AetherClient {
    * @param options.filename - Filename for the document. Defaults to `"upload.bin"`.
    * @param options.contentType - MIME type. Defaults to `"application/octet-stream"`.
    * @param options.tags - Metadata tags for filtering.
+   * @param options.entityId - Caller-supplied entity to associate the document with.
    * @returns The created document record.
    * @throws {AetherApiError} On non-2xx API response.
    * @throws {AetherNetworkError} On connection or timeout failure.
    */
   async insertStream(
     stream: ReadableStream<Uint8Array>,
-    options?: { filename?: string; contentType?: string; tags?: string[] },
+    options?: { filename?: string; contentType?: string; tags?: string[]; entityId?: string },
   ): Promise<DocumentRecord> {
     const filename = options?.filename ?? "upload.bin";
     const contentType = options?.contentType ?? "application/octet-stream";
@@ -380,6 +410,9 @@ export class AetherClient {
     });
     if (options?.tags && options.tags.length > 0) {
       params.set("tags", options.tags.join(","));
+    }
+    if (options?.entityId) {
+      params.set("entity_id", options.entityId);
     }
     return this._requestNoRetry<DocumentRecord>(`/documents?${params}`, {
       method: "POST",
@@ -397,6 +430,7 @@ export class AetherClient {
    * @param options - Insert options.
    * @param options.filename - Filename for the document. Defaults to `"text.txt"`.
    * @param options.tags - Metadata tags for filtering.
+   * @param options.entityId - Caller-supplied entity to associate the document with.
    * @param options.chunking - Chunking configuration for document splitting.
    * @returns The created document record.
    * @throws {AetherError} If text is empty or chunking config is invalid.
@@ -405,7 +439,7 @@ export class AetherClient {
    */
   async insertText(
     text: string,
-    options?: { filename?: string; tags?: string[]; chunking?: ChunkingConfig },
+    options?: { filename?: string; tags?: string[]; entityId?: string; chunking?: ChunkingConfig },
   ): Promise<DocumentRecord> {
     if (!text) throw new AetherError("text is required");
     if (options?.chunking?.chunkSize !== undefined && options.chunking.chunkSize < 1) {
@@ -421,6 +455,9 @@ export class AetherClient {
     });
     if (options?.tags && options.tags.length > 0) {
       params.set("tags", options.tags.join(","));
+    }
+    if (options?.entityId) {
+      params.set("entity_id", options.entityId);
     }
     if (options?.chunking?.chunkSize) {
       params.set("chunk_size", options.chunking.chunkSize.toString());
@@ -444,6 +481,7 @@ export class AetherClient {
    * @param options.filename - New filename for the document (required).
    * @param options.contentType - MIME type. Guessed from filename if omitted.
    * @param options.tags - Metadata tags for filtering (replaces existing tags).
+   * @param options.entityId - Caller-supplied entity to associate the document with.
    * @param options.chunking - Chunking configuration for document splitting.
    * @returns The updated document record.
    * @throws {AetherError} If docId or filename is empty, or chunking config is invalid.
@@ -453,7 +491,7 @@ export class AetherClient {
   async update(
     docId: string,
     data: Uint8Array,
-    options: { filename: string; contentType?: string; tags?: string[]; chunking?: ChunkingConfig },
+    options: { filename: string; contentType?: string; tags?: string[]; entityId?: string; chunking?: ChunkingConfig },
   ): Promise<DocumentRecord> {
     if (!docId) throw new AetherError("docId is required");
     if (!options.filename) throw new AetherError("filename is required");
@@ -470,6 +508,9 @@ export class AetherClient {
     });
     if (options.tags && options.tags.length > 0) {
       params.set("tags", options.tags.join(","));
+    }
+    if (options.entityId) {
+      params.set("entity_id", options.entityId);
     }
     if (options.chunking?.chunkSize) {
       params.set("chunk_size", options.chunking.chunkSize.toString());
@@ -544,6 +585,10 @@ export class AetherClient {
    * @param options.maxDistance - Optional cosine-distance ceiling. Results with
    *   `distance > maxDistance` are dropped server-side, after reranking. Omit to
    *   return the top-k regardless of distance (the historical behavior).
+   * @param options.entityId - Restrict results to documents belonging to this entity.
+   * @param options.since - Only match documents created at or after this RFC3339 timestamp.
+   * @param options.until - Only match documents created at or before this RFC3339 timestamp.
+   * @param options.lastNDays - Convenience window: only match documents from the last N days.
    * @returns Deduplicated search results with full document content attached.
    * @throws {AetherError} If query is empty or k is less than 1.
    * @throws {AetherApiError} On non-2xx API response.
@@ -552,7 +597,7 @@ export class AetherClient {
   async retrieve(
     query: string,
     k: number = 5,
-    options?: { tags?: string[]; maxDistance?: number },
+    options?: { tags?: string[]; maxDistance?: number; entityId?: string; since?: string; until?: string; lastNDays?: number },
   ): Promise<RetrievalResult[]> {
     if (!query) throw new AetherError("query is required");
     if (k < 1) throw new AetherError("k must be at least 1");
@@ -560,6 +605,10 @@ export class AetherClient {
       includeContent: true,
       tags: options?.tags,
       maxDistance: options?.maxDistance,
+      entityId: options?.entityId,
+      since: options?.since,
+      until: options?.until,
+      lastNDays: options?.lastNDays,
     });
 
     // Deduplicate by doc_id, keeping the closest match
@@ -598,6 +647,10 @@ export class AetherClient {
    * @param options - Pagination options.
    * @param options.offset - Number of documents to skip. Defaults to `0`.
    * @param options.limit - Maximum number of documents to return.
+   * @param options.entityId - Restrict the listing to documents belonging to this entity.
+   * @param options.since - Only list documents created at or after this RFC3339 timestamp.
+   * @param options.until - Only list documents created at or before this RFC3339 timestamp.
+   * @param options.lastNDays - Convenience window: only list documents from the last N days.
    * @returns An object containing the document list, total count, and whether more pages exist.
    * @throws {AetherApiError} On non-2xx API response.
    * @throws {AetherNetworkError} On connection or timeout failure.
@@ -605,10 +658,15 @@ export class AetherClient {
   async list(options?: {
     offset?: number;
     limit?: number;
+    entityId?: string;
+    since?: string;
+    until?: string;
+    lastNDays?: number;
   }): Promise<{ documents: DocumentRecord[]; total: number; has_more: boolean }> {
     const params = new URLSearchParams();
     if (options?.offset != null) params.set("offset", String(options.offset));
     if (options?.limit != null) params.set("limit", String(options.limit));
+    AetherClient.applyFilterParams(params, options);
     const query = params.toString();
     const body = await this._request<{
       documents: DocumentRecord[];
@@ -653,6 +711,38 @@ export class AetherClient {
     );
   }
 
+  /**
+   * Backfill `entity_id` on existing documents by deriving it from a tag prefix.
+   * For every document carrying a tag like `"<tagPrefix><value>"`, the server
+   * sets `entity_id` to `<value>`. Use this to migrate a tag-based grouping
+   * convention onto the first-class entity field.
+   *
+   * By default documents that already have an `entity_id` are left untouched;
+   * pass `overwrite: true` to replace existing values.
+   *
+   * @param tagPrefix - The tag prefix identifying the entity (e.g. `"user:"`). Required.
+   * @param opts - Backfill options.
+   * @param opts.overwrite - When `true`, overwrite documents that already have an `entity_id`. Defaults to `false`.
+   * @returns A report of how many documents were scanned, matched, updated, skipped, ambiguous, or errored.
+   * @throws {AetherError} If tagPrefix is empty.
+   * @throws {AetherApiError} On non-2xx API response.
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async backfillEntityFromTags(
+    tagPrefix: string,
+    opts?: { overwrite?: boolean },
+  ): Promise<EntityBackfillReport> {
+    if (!tagPrefix) throw new AetherError("tagPrefix is required");
+    return this._request<EntityBackfillReport>("/documents/backfill-entity", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tag_prefix: tagPrefix,
+        overwrite: opts?.overwrite ?? false,
+      }),
+    });
+  }
+
   // ── Search ────────────────────────────────────────────────────────
 
   /**
@@ -667,6 +757,10 @@ export class AetherClient {
    *   `distance > maxDistance` are dropped server-side, after reranking. Smaller
    *   = stricter (0.0 = exact match, ~1.0 = unrelated). Omit to return the
    *   top-k regardless of distance (the historical behavior).
+   * @param options.entityId - Restrict results to documents belonging to this entity.
+   * @param options.since - Only match documents created at or after this RFC3339 timestamp.
+   * @param options.until - Only match documents created at or before this RFC3339 timestamp.
+   * @param options.lastNDays - Convenience window: only match documents from the last N days.
    * @returns Array of search results ordered by similarity (closest first).
    * @throws {AetherError} If query is empty or k is less than 1.
    * @throws {AetherApiError} On non-2xx API response.
@@ -675,7 +769,7 @@ export class AetherClient {
   async search(
     query: string,
     k: number = 10,
-    options?: { includeContent?: boolean; tags?: string[]; maxDistance?: number },
+    options?: { includeContent?: boolean; tags?: string[]; maxDistance?: number; entityId?: string; since?: string; until?: string; lastNDays?: number },
   ): Promise<SearchResult[]> {
     if (!query) throw new AetherError("query is required");
     if (k < 1) throw new AetherError("k must be at least 1");
@@ -689,6 +783,7 @@ export class AetherClient {
     if (options?.maxDistance != null) {
       params.set("max_distance", String(options.maxDistance));
     }
+    AetherClient.applyFilterParams(params, options);
     const body = await this._request<{
       query: string;
       results: SearchResult[];
@@ -709,6 +804,7 @@ export class AetherClient {
    * @param options.filename - Filename for the document. Defaults to `"text.txt"`.
    * @param options.contentType - MIME type. Defaults to `"text/plain"`.
    * @param options.tags - Metadata tags for filtering.
+   * @param options.entityId - Caller-supplied entity to associate the document with.
    * @returns The created document record.
    * @throws {AetherError} If content is empty, or neither passages nor embedding is provided.
    * @throws {AetherApiError} On non-2xx API response.
@@ -721,6 +817,7 @@ export class AetherClient {
     filename?: string;
     contentType?: string;
     tags?: string[];
+    entityId?: string;
   }): Promise<DocumentRecord> {
     if (!options.content) throw new AetherError("content is required");
     if (!options.passages?.length && !options.embedding?.length) {
@@ -736,6 +833,7 @@ export class AetherClient {
         filename: options.filename ?? "text.txt",
         content_type: options.contentType ?? "text/plain",
         tags: options.tags,
+        entity_id: options.entityId,
       }),
     });
   }
@@ -750,6 +848,10 @@ export class AetherClient {
    * @param options.includeContent - When `true`, include document/passage content in results.
    * @param options.tags - Filter results to documents matching these tags.
    * @param options.maxDistance - Optional cosine-distance ceiling. See {@link search}.
+   * @param options.entityId - Restrict results to documents belonging to this entity.
+   * @param options.since - Only match documents created at or after this RFC3339 timestamp.
+   * @param options.until - Only match documents created at or before this RFC3339 timestamp.
+   * @param options.lastNDays - Convenience window: only match documents from the last N days.
    * @returns Array of search results ordered by similarity (closest first).
    * @throws {AetherError} If embedding is empty or k is less than 1.
    * @throws {AetherApiError} On non-2xx API response.
@@ -758,7 +860,7 @@ export class AetherClient {
   async searchByVector(
     embedding: number[],
     k: number = 10,
-    options?: { includeContent?: boolean; tags?: string[]; maxDistance?: number },
+    options?: { includeContent?: boolean; tags?: string[]; maxDistance?: number; entityId?: string; since?: string; until?: string; lastNDays?: number },
   ): Promise<SearchResult[]> {
     if (!embedding || embedding.length === 0) throw new AetherError("embedding must be a non-empty array");
     if (k < 1) throw new AetherError("k must be at least 1");
@@ -774,6 +876,10 @@ export class AetherClient {
         include_content: options?.includeContent ?? false,
         tags: options?.tags,
         max_distance: options?.maxDistance,
+        entity_id: options?.entityId,
+        since: options?.since,
+        until: options?.until,
+        last_n_days: options?.lastNDays,
       }),
     });
     return body.results;
@@ -919,9 +1025,10 @@ export class AetherClient {
       throw new AetherError("overlap must be non-negative");
     }
     const payload = {
-      documents: documents.map((doc) => ({
+      documents: documents.map(({ entityId, ...doc }) => ({
         ...doc,
         tags: doc.tags && doc.tags.length > 0 ? doc.tags.join(",") : undefined,
+        entity_id: entityId,
       })),
       chunk_size: options?.chunking?.chunkSize,
       overlap: options?.chunking?.overlap,
@@ -957,9 +1064,11 @@ export class AetherClient {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          queries: queries.map((query) => ({
+          queries: queries.map(({ entityId, lastNDays, ...query }) => ({
             ...query,
             tags: query.tags && query.tags.length > 0 ? query.tags.join(",") : undefined,
+            entity_id: entityId,
+            last_n_days: lastNDays,
           })),
         }),
       },

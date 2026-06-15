@@ -661,4 +661,213 @@ describe("AetherClient", () => {
       expect(url).toContain("/search/embed");
     });
   });
+
+  // ── entity_id (AET-146) ──────────────────────────────────────────
+
+  describe("entity_id on insert family", () => {
+    function docResponse() {
+      return jsonResponse({
+        doc_id: "e-1",
+        cid: "c1",
+        content_type: "text/plain",
+        size_bytes: 5,
+        chunks: 1,
+        vectors: 1,
+        version: 1,
+        entity_id: "user-42",
+      });
+    }
+
+    it("insert maps entityId to the entity_id query param", async () => {
+      mockFetch.mockResolvedValueOnce(docResponse());
+      const data = new TextEncoder().encode("hello");
+      const doc = await client.insert(data, { filename: "a.txt", entityId: "user-42" });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=user-42");
+      expect(doc.entity_id).toBe("user-42");
+    });
+
+    it("insertText maps entityId to the entity_id query param", async () => {
+      mockFetch.mockResolvedValueOnce(docResponse());
+      await client.insertText("hello", { entityId: "user-42" });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=user-42");
+    });
+
+    it("insertStream maps entityId to the entity_id query param", async () => {
+      mockFetch.mockResolvedValueOnce(docResponse());
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data"));
+          controller.close();
+        },
+      });
+      await client.insertStream(stream, { entityId: "user-42" });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=user-42");
+    });
+
+    it("update maps entityId to the entity_id query param", async () => {
+      mockFetch.mockResolvedValueOnce(docResponse());
+      const data = new TextEncoder().encode("updated");
+      await client.update("e-1", data, { filename: "a.txt", entityId: "user-42" });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=user-42");
+    });
+
+    it("insertWithEmbeddings sends entity_id in the JSON body", async () => {
+      mockFetch.mockResolvedValueOnce(docResponse());
+      await client.insertWithEmbeddings({ content: "hello", embedding: [0.1, 0.2], entityId: "user-42" });
+      const [, init] = mockFetch.mock.calls[0];
+      expect(JSON.parse(init.body as string).entity_id).toBe("user-42");
+    });
+
+    it("omits entity_id when not provided", async () => {
+      mockFetch.mockResolvedValueOnce(docResponse());
+      await client.insertText("hello");
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).not.toContain("entity_id");
+    });
+  });
+
+  describe("entity_id and time-window filters on search/retrieve/list", () => {
+    it("search forwards entityId, since, until and lastNDays as snake_case params", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "q", results: [] }));
+      await client.search("q", 5, {
+        entityId: "user-42",
+        since: "2026-01-01T00:00:00Z",
+        until: "2026-02-01T00:00:00Z",
+        lastNDays: 7,
+      });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=user-42");
+      expect(url).toContain("since=2026-01-01");
+      expect(url).toContain("until=2026-02-01");
+      expect(url).toContain("last_n_days=7");
+    });
+
+    it("search keeps max_distance working alongside the new filters", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "q", results: [] }));
+      await client.search("q", 5, { maxDistance: 0.3, entityId: "user-42" });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("max_distance=0.3");
+      expect(url).toContain("entity_id=user-42");
+    });
+
+    it("list forwards the filters as snake_case params", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ documents: [], count: 0, total: 0, has_more: false }),
+      );
+      await client.list({ entityId: "user-42", lastNDays: 30 });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=user-42");
+      expect(url).toContain("last_n_days=30");
+    });
+
+    it("retrieve forwards entityId through to search", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "q",
+          results: [
+            { doc_id: "d-1", distance: 0.1, content_type: "text/plain", content: "body", entity_id: "user-42" },
+          ],
+        }),
+      );
+      const results = await client.retrieve("q", 5, { entityId: "user-42" });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=user-42");
+      expect(results[0].entity_id).toBe("user-42");
+    });
+
+    it("searchByVector sends the filters in the JSON body", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+      await client.searchByVector([0.1, 0.2], 5, {
+        entityId: "user-42",
+        since: "2026-01-01T00:00:00Z",
+        until: "2026-02-01T00:00:00Z",
+        lastNDays: 7,
+      });
+      const [, init] = mockFetch.mock.calls[0];
+      const sent = JSON.parse(init.body as string);
+      expect(sent.entity_id).toBe("user-42");
+      expect(sent.since).toBe("2026-01-01T00:00:00Z");
+      expect(sent.until).toBe("2026-02-01T00:00:00Z");
+      expect(sent.last_n_days).toBe(7);
+    });
+  });
+
+  describe("entity_id on batch operations", () => {
+    it("batchInsert maps per-document entityId to entity_id", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ results: [{ doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1 }] }),
+      );
+      await client.batchInsert([{ filename: "a.txt", content: "hello", entityId: "user-42" }]);
+      const [, init] = mockFetch.mock.calls[0];
+      const sent = JSON.parse(init.body as string);
+      expect(sent.documents[0].entity_id).toBe("user-42");
+      expect(sent.documents[0]).not.toHaveProperty("entityId");
+    });
+
+    it("batchSearch maps per-query entityId and lastNDays to snake_case", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ results: [{ query: "q", results: [] }] }),
+      );
+      await client.batchSearch([
+        { q: "q", k: 5, entityId: "user-42", since: "2026-01-01T00:00:00Z", lastNDays: 7 },
+      ]);
+      const [, init] = mockFetch.mock.calls[0];
+      const sent = JSON.parse(init.body as string);
+      expect(sent.queries[0].entity_id).toBe("user-42");
+      expect(sent.queries[0].since).toBe("2026-01-01T00:00:00Z");
+      expect(sent.queries[0].last_n_days).toBe(7);
+      expect(sent.queries[0]).not.toHaveProperty("entityId");
+      expect(sent.queries[0]).not.toHaveProperty("lastNDays");
+    });
+  });
+
+  describe("backfillEntityFromTags", () => {
+    it("POSTs tag_prefix and overwrite to /documents/backfill-entity", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          scanned: 10,
+          updated: 5,
+          skipped_existing: 2,
+          skipped_no_match: 3,
+          skipped_ambiguous: 0,
+          skipped_invalid: 0,
+        }),
+      );
+      const report = await client.backfillEntityFromTags("user:", { overwrite: true });
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toContain("/documents/backfill-entity");
+      expect(init.method).toBe("POST");
+      const sent = JSON.parse(init.body as string);
+      expect(sent.tag_prefix).toBe("user:");
+      expect(sent.overwrite).toBe(true);
+      expect(report.scanned).toBe(10);
+      expect(report.updated).toBe(5);
+      expect(report.skipped_existing).toBe(2);
+      expect(report.skipped_no_match).toBe(3);
+    });
+
+    it("defaults overwrite to false", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          scanned: 0,
+          updated: 0,
+          skipped_existing: 0,
+          skipped_no_match: 0,
+          skipped_ambiguous: 0,
+          skipped_invalid: 0,
+        }),
+      );
+      await client.backfillEntityFromTags("user:");
+      const [, init] = mockFetch.mock.calls[0];
+      expect(JSON.parse(init.body as string).overwrite).toBe(false);
+    });
+
+    it("rejects an empty tagPrefix", async () => {
+      await expect(client.backfillEntityFromTags("")).rejects.toThrow("tagPrefix");
+    });
+  });
 });
