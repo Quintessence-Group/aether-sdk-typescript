@@ -344,7 +344,7 @@ describe("AetherClient", () => {
           results: [
             {
               doc_id: "abc",
-              distance: 0.15,
+              score: 92.5,
               title: "ML Intro",
               content_type: "text/plain",
             },
@@ -357,7 +357,7 @@ describe("AetherClient", () => {
       expect(url).toContain("q=machine+learning");
       expect(url).toContain("k=5");
       expect(results).toHaveLength(1);
-      expect(results[0].distance).toBe(0.15);
+      expect(results[0].score).toBe(92.5);
     });
 
     it("defaults k to 10", async () => {
@@ -418,8 +418,8 @@ describe("AetherClient", () => {
         jsonResponse({
           query: "test query",
           results: [
-            { doc_id: "doc-1", distance: 0.1, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-2", distance: 0.3, title: "Doc 2", content_type: "text/plain" },
+            { doc_id: "doc-1", score: 95, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-2", score: 80, title: "Doc 2", content_type: "text/plain" },
           ],
         }),
       );
@@ -435,7 +435,7 @@ describe("AetherClient", () => {
       expect(results).toHaveLength(2);
       expect(results[0].doc_id).toBe("doc-1");
       expect(results[0].content).toBe("Content of doc 1");
-      expect(results[0].distance).toBe(0.1);
+      expect(results[0].score).toBe(95);
       expect(results[1].content).toBe("Content of doc 2");
     });
 
@@ -444,9 +444,9 @@ describe("AetherClient", () => {
         jsonResponse({
           query: "test",
           results: [
-            { doc_id: "doc-1", distance: 0.1, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-1", distance: 0.2, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-2", distance: 0.3, title: "Doc 2", content_type: "text/plain" },
+            { doc_id: "doc-1", score: 95, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-1", score: 88, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-2", score: 70, title: "Doc 2", content_type: "text/plain" },
           ],
         }),
       );
@@ -460,8 +460,8 @@ describe("AetherClient", () => {
       const results = await client.retrieve("test", 5);
       // Should only have 2 results despite 3 search hits
       expect(results).toHaveLength(2);
-      // Should keep the closest match (distance 0.1, not 0.2)
-      expect(results[0].distance).toBe(0.1);
+      // Should keep the best (first) match (score 95, not 88)
+      expect(results[0].score).toBe(95);
     });
   });
 
@@ -568,7 +568,7 @@ describe("AetherClient", () => {
   describe("batchSearch", () => {
     it("sends POST to /search/batch", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({
-        results: [{ query: "test", results: [{ doc_id: "a", distance: 0.1, content_type: "text/plain" }] }],
+        results: [{ query: "test", results: [{ doc_id: "a", score: 90, content_type: "text/plain" }] }],
       }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       const results = await client.batchSearch([{ q: "test", k: 5 }]);
@@ -653,7 +653,7 @@ describe("AetherClient", () => {
 
   describe("searchByVector", () => {
     it("sends POST to /search/embed", async () => {
-      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [{ doc_id: "a", distance: 0.1, content_type: "text/plain" }] }));
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [{ doc_id: "a", score: 90, content_type: "text/plain" }] }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       const results = await client.searchByVector([0.1, 0.2], 5);
       expect(results).toHaveLength(1);
@@ -769,14 +769,19 @@ describe("AetherClient", () => {
         jsonResponse({
           query: "q",
           results: [
-            { doc_id: "d-1", distance: 0.1, content_type: "text/plain", content: "body", entity_id: "user-42" },
+            { doc_id: "d-1", score: 90, content_type: "text/plain", entity_id: "user-42" },
           ],
         }),
+      );
+      // retrieve() downloads each unique doc's full text (search no longer inlines content).
+      mockFetch.mockResolvedValueOnce(
+        binaryResponse(new TextEncoder().encode("body")),
       );
       const results = await client.retrieve("q", 5, { entityId: "user-42" });
       const [url] = mockFetch.mock.calls[0];
       expect(url).toContain("entity_id=user-42");
       expect(results[0].entity_id).toBe("user-42");
+      expect(results[0].content).toBe("body");
     });
 
     it("searchByVector sends the filters in the JSON body", async () => {
