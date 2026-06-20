@@ -5,7 +5,7 @@ import type { RetrievalResult, SearchResult } from "../src/models.js";
 function makeResult(overrides: Partial<RetrievalResult> = {}): RetrievalResult {
   return {
     doc_id: "d1",
-    distance: 0.1,
+    score: 90,
     content: "full body",
     content_type: "text/plain",
     ...overrides,
@@ -60,19 +60,19 @@ describe("formatContext options", () => {
     expect(out).not.toContain("chunk");
   });
 
-  it("custom template with title and distance", () => {
+  it("custom template with title and score", () => {
     const results = [
       makeResult({
         doc_id: "d1",
         title: "PTO policy",
-        distance: 0.123,
+        score: 92.5,
         content: "20 days",
       }),
     ];
     const out = formatContext(results, {
-      template: "<{title} | d={distance:.2f}>\n{text}",
+      template: "<{title} | s={score:.1f}>\n{text}",
     });
-    expect(out).toBe("<PTO policy | d=0.12>\n20 days");
+    expect(out).toBe("<PTO policy | s=92.5>\n20 days");
   });
 
   it("custom template falls back to doc_id when title is missing", () => {
@@ -90,22 +90,22 @@ describe("formatContext options", () => {
 });
 
 describe("formatContext result types", () => {
-  it("accepts SearchResult with content", () => {
-    // search(includeContent: true) returns SearchResult with content populated.
+  it("accepts a plain SearchResult and renders its passage", () => {
+    // search() returns SearchResult carrying the matched passage (no full content).
     const sr: SearchResult = {
       doc_id: "d1",
-      distance: 0.1,
+      score: 90,
       content_type: "text/plain",
-      content: "search body",
+      passage: "search body",
     };
     expect(formatContext([sr])).toContain("search body");
   });
 
-  it("SearchResult without content or passage renders empty text", () => {
-    // search() without includeContent has both fields undefined.
+  it("SearchResult without a passage renders empty text", () => {
+    // A search hit with no passage has no text to render.
     const sr: SearchResult = {
       doc_id: "d1",
-      distance: 0.1,
+      score: 90,
       content_type: "text/plain",
     };
     const out = formatContext([sr]);

@@ -14,9 +14,9 @@ export interface FormatContextOptions {
   /**
    * Format string per source. Available placeholders:
    * `{i}` (1-based source number), `{doc_id}`, `{title}` (falls back to
-   * `{doc_id}` when missing), `{text}` (passage or content), `{distance}`.
+   * `{doc_id}` when missing), `{text}` (passage or content), `{score}`.
    * Numeric placeholders accept a Python-style fixed-precision spec, e.g.
-   * `{distance:.2f}`.
+   * `{score:.1f}`.
    */
   template?: string;
   /** String joined between formatted sources. Defaults to `"\n\n"`. */
@@ -90,7 +90,9 @@ export function formatContext(
   const chunks: string[] = [];
   results.forEach((r, idx) => {
     const passage = r.passage ?? "";
-    const content = r.content ?? "";
+    // `content` (full document text) is present only on RetrievalResult, which
+    // `retrieve()` returns; plain `search()` results carry just the passage.
+    const content = "content" in r ? r.content : "";
     const text = preferPassage ? passage || content : content || passage;
     chunks.push(
       renderTemplate(template, {
@@ -98,7 +100,7 @@ export function formatContext(
         doc_id: r.doc_id,
         title: r.title ?? r.doc_id,
         text,
-        distance: r.distance,
+        score: r.score,
       }),
     );
   });

@@ -15,11 +15,12 @@ export interface DocumentRecord {
 
 export interface SearchResult {
   doc_id: string;
-  distance: number;
+  /** Calibrated relevance, 0–100 (higher = better); ~100 for a near-exact match. */
+  score: number;
   title?: string;
   content_type: string;
-  content?: string;
-  /** The specific passage that matched the query vector, if available. */
+  /** The specific passage (chunk) that matched the query. Fetch the full
+   *  document text with `getDocument`/`downloadText` rather than inline. */
   passage?: string;
   /** Entity the matched document belongs to, if any. */
   entity_id?: string;
@@ -54,7 +55,6 @@ export interface BatchSearchQuery {
   q: string;
   k?: number;
   tags?: string[];
-  include_content?: boolean;
   /** Restrict results to documents belonging to this entity. */
   entityId?: string;
   /** Only match documents created at or after this RFC3339 timestamp. */

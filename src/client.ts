@@ -575,8 +575,9 @@ export class AetherClient {
    * Search and return results with document content included.
    *
    * Combines {@link search} + {@link downloadText} into a single call for RAG workflows.
-   * Results are deduplicated by `doc_id` (closest match wins).
-   * Uses server-side `include_content` when available, falling back to per-doc downloads.
+   * Results are deduplicated by `doc_id` (closest match wins). Search returns only
+   * the matched passage, so each unique document's full text is downloaded by id
+   * and attached as `content`.
    *
    * @param query - Natural-language search query.
    * @param k - Maximum number of results to return. Defaults to `5`.
@@ -602,7 +603,6 @@ export class AetherClient {
     if (!query) throw new AetherError("query is required");
     if (k < 1) throw new AetherError("k must be at least 1");
     const results = await this.search(query, k, {
-      includeContent: true,
       tags: options?.tags,
       maxDistance: options?.maxDistance,
       entityId: options?.entityId,
@@ -621,23 +621,14 @@ export class AetherClient {
 
     const unique = Array.from(seen.values());
 
-    // Use inline content if server provided it, otherwise download
-    const needsDownload = unique.filter((r) => r.content == null);
-    if (needsDownload.length > 0) {
-      const downloaded = await Promise.all(
-        needsDownload.map((r) => this.downloadText(r.doc_id)),
-      );
-      const contentMap = new Map<string, string>();
-      needsDownload.forEach((r, i) => contentMap.set(r.doc_id, downloaded[i]));
-      return unique.map((r) => ({
-        ...r,
-        content: r.content ?? contentMap.get(r.doc_id)!,
-      }));
-    }
-
-    return unique.map((r) => ({
+    // Search returns only the matched passage now (never full document
+    // content), so fetch each unique document's text by id for RAG prompts.
+    const downloaded = await Promise.all(
+      unique.map((r) => this.downloadText(r.doc_id)),
+    );
+    return unique.map((r, i) => ({
       ...r,
-      content: r.content!,
+      content: downloaded[i],
     }));
   }
 
@@ -751,7 +742,6 @@ export class AetherClient {
    * @param query - Natural-language search query.
    * @param k - Maximum number of results to return. Defaults to `10`.
    * @param options - Search options.
-   * @param options.includeContent - When `true`, include document/passage content in results.
    * @param options.tags - Filter results to documents matching these tags.
    * @param options.maxDistance - Optional cosine-distance ceiling. Results with
    *   `distance > maxDistance` are dropped server-side, after reranking. Smaller
@@ -769,14 +759,11 @@ export class AetherClient {
   async search(
     query: string,
     k: number = 10,
-    options?: { includeContent?: boolean; tags?: string[]; maxDistance?: number; entityId?: string; since?: string; until?: string; lastNDays?: number },
+    options?: { tags?: string[]; maxDistance?: number; entityId?: string; since?: string; until?: string; lastNDays?: number },
   ): Promise<SearchResult[]> {
     if (!query) throw new AetherError("query is required");
     if (k < 1) throw new AetherError("k must be at least 1");
     const params = new URLSearchParams({ q: query, k: String(k) });
-    if (options?.includeContent) {
-      params.set("include_content", "true");
-    }
     if (options?.tags && options.tags.length > 0) {
       params.set("tags", options.tags.join(","));
     }
@@ -845,7 +832,6 @@ export class AetherClient {
    * @param embedding - Pre-computed query embedding vector (must be non-empty).
    * @param k - Maximum number of results to return. Defaults to `10`.
    * @param options - Search options.
-   * @param options.includeContent - When `true`, include document/passage content in results.
    * @param options.tags - Filter results to documents matching these tags.
    * @param options.maxDistance - Optional cosine-distance ceiling. See {@link search}.
    * @param options.entityId - Restrict results to documents belonging to this entity.
@@ -860,7 +846,7 @@ export class AetherClient {
   async searchByVector(
     embedding: number[],
     k: number = 10,
-    options?: { includeContent?: boolean; tags?: string[]; maxDistance?: number; entityId?: string; since?: string; until?: string; lastNDays?: number },
+    options?: { tags?: string[]; maxDistance?: number; entityId?: string; since?: string; until?: string; lastNDays?: number },
   ): Promise<SearchResult[]> {
     if (!embedding || embedding.length === 0) throw new AetherError("embedding must be a non-empty array");
     if (k < 1) throw new AetherError("k must be at least 1");
@@ -873,7 +859,6 @@ export class AetherClient {
       body: JSON.stringify({
         embedding,
         k,
-        include_content: options?.includeContent ?? false,
         tags: options?.tags,
         max_distance: options?.maxDistance,
         entity_id: options?.entityId,
@@ -1050,7 +1035,7 @@ export class AetherClient {
    * More efficient than calling {@link search} in a loop because the server
    * processes all queries in one round-trip.
    *
-   * @param queries - Array of search queries, each with `q`, optional `k`, `tags`, and `include_content`.
+   * @param queries - Array of search queries, each with `q`, optional `k`, `tags`, and entity/time-window filters.
    * @returns Array of batch search responses, one per input query, each containing its results.
    * @throws {AetherError} If queries array is empty.
    * @throws {AetherApiError} On non-2xx API response.
