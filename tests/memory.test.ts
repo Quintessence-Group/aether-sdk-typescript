@@ -4,7 +4,7 @@ import { CreditExhaustedError } from "../src/errors.js";
 import { Memory, type MemoryItem } from "../src/memory.js";
 
 /**
- * Contract test for the {@link Memory} facade (AET-145).
+ * Contract test for the {@link Memory} facade.
  *
  * Mocked at the same transport layer as the existing client tests
  * (`vi.stubGlobal("fetch", ...)`) with the *real* raw client underneath,

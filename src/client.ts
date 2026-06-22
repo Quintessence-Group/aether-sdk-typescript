@@ -583,8 +583,8 @@ export class AetherClient {
    * @param k - Maximum number of results to return. Defaults to `5`.
    * @param options - Retrieval options.
    * @param options.tags - Filter results to documents matching these tags.
-   * @param options.maxDistance - Optional cosine-distance ceiling. Results with
-   *   `distance > maxDistance` are dropped server-side, after reranking. Omit to
+   * @param options.maxDistance - Optional relevance-distance ceiling. Results with
+   *   `distance > maxDistance` are dropped server-side. Omit to
    *   return the top-k regardless of distance (the historical behavior).
    * @param options.entityId - Restrict results to documents belonging to this entity.
    * @param options.since - Only match documents created at or after this RFC3339 timestamp.
@@ -743,8 +743,8 @@ export class AetherClient {
    * @param k - Maximum number of results to return. Defaults to `10`.
    * @param options - Search options.
    * @param options.tags - Filter results to documents matching these tags.
-   * @param options.maxDistance - Optional cosine-distance ceiling. Results with
-   *   `distance > maxDistance` are dropped server-side, after reranking. Smaller
+   * @param options.maxDistance - Optional relevance-distance ceiling. Results with
+   *   `distance > maxDistance` are dropped server-side. Smaller
    *   = stricter (0.0 = exact match, ~1.0 = unrelated). Omit to return the
    *   top-k regardless of distance (the historical behavior).
    * @param options.entityId - Restrict results to documents belonging to this entity.
@@ -833,7 +833,7 @@ export class AetherClient {
    * @param k - Maximum number of results to return. Defaults to `10`.
    * @param options - Search options.
    * @param options.tags - Filter results to documents matching these tags.
-   * @param options.maxDistance - Optional cosine-distance ceiling. See {@link search}.
+   * @param options.maxDistance - Optional relevance-distance ceiling. See {@link search}.
    * @param options.entityId - Restrict results to documents belonging to this entity.
    * @param options.since - Only match documents created at or after this RFC3339 timestamp.
    * @param options.until - Only match documents created at or before this RFC3339 timestamp.

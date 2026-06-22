@@ -94,7 +94,7 @@ export interface MemoryListOptions {
 const OVERFETCH = 4;
 const MAX_CANDIDATES = 100;
 
-/** Maximum `entity_id` length accepted by the server (AET-146). */
+/** Maximum `entity_id` length accepted by the server. */
 const MAX_ENTITY_ID_LEN = 256;
 
 /**

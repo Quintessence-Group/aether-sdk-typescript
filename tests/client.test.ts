@@ -662,7 +662,7 @@ describe("AetherClient", () => {
     });
   });
 
-  // ── entity_id (AET-146) ──────────────────────────────────────────
+  // ── entity_id ──────────────────────────────────────────
 
   describe("entity_id on insert family", () => {
     function docResponse() {
