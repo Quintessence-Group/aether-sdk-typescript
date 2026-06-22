@@ -23,3 +23,10 @@ export type {
 } from "./models.js";
 export { formatContext, DEFAULT_TEMPLATE } from "./rag.js";
 export type { FormatContextOptions, FormatContextResult } from "./rag.js";
+export { Memory } from "./memory.js";
+export type {
+  MemoryItem,
+  MemoryOptions,
+  RecallOptions,
+  MemoryListOptions,
+} from "./memory.js";
