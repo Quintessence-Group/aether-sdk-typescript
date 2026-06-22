@@ -1,0 +1,97 @@
+name: Release
+
+# Publishes @aether-ai/sdk to npm using Trusted Publishing (OIDC).
+# Once the trusted publisher is registered, no long-lived token is stored: npm
+# (>= 11.5.1) exchanges the GitHub OIDC token for short-lived credentials at
+# publish time and attaches provenance automatically.
+#
+# Trigger:  git tag v<version> && git push origin v<version>
+#           (the tag must match package.json's "version")
+#
+# Matches the npmjs.com trusted-publishing policy:
+#   package: @aether-ai/sdk · repo: Quintessence-Group/aether-sdk-typescript
+#   workflow: release.yml · environment: prod
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write # required for the npm Trusted Publishing OIDC exchange
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+          registry-url: "https://registry.npmjs.org"
+
+      # OIDC trusted publishing requires npm >= 11.5.1; Node 20 ships npm 10.x.
+      - name: Ensure npm supports OIDC trusted publishing
+        run: npm install -g npm@^11.5.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (type-check)
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify tag matches package.json version
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
+            exit 1
+          fi
+
+      # Publishes via OIDC trusted publishing — NO stored token. The npm Trusted Publisher is
+      # registered at npmjs.com (@aether-ai/sdk -> Settings -> Trusted Publisher ->
+      #   repo: Quintessence-Group/aether-sdk-typescript | workflow: release.yml | environment: prod),
+      # so npm >= 11.5.1 authenticates with the short-lived GitHub OIDC token minted for this run
+      # and attaches provenance automatically. (id-token: write above is what enables the exchange.)
+      - name: Publish to npm (OIDC trusted publishing)
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          # Prerelease versions (contain a hyphen, e.g. 0.4.0-rc.1) must NOT move `latest`.
+          if [[ "$PKG_VERSION" == *-* ]]; then
+            NPM_TAG=rc
+          else
+            NPM_TAG=latest
+          fi
+          echo "Publishing $PKG_VERSION to dist-tag '$NPM_TAG'"
+          npm publish --provenance --access public --tag "$NPM_TAG"
+
+      - name: Install smoke from npm
+        working-directory: /tmp
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          mkdir -p /tmp/aether-ts-smoke && cd /tmp/aether-ts-smoke
+          npm init -y
+          for attempt in 1 2 3 4 5; do
+            if npm install "@aether-ai/sdk@${TAG_VERSION}"; then break; fi
+            [ "$attempt" = "5" ] && exit 1
+            sleep 30
+          done
+          echo "ESM import check:"
+          node --input-type=module -e "import('@aether-ai/sdk').then((m) => console.log('ESM keys:', Object.keys(m).length)).catch((e) => { console.error('ESM import failed:', e); process.exit(1); })"
+          echo "CJS require check:"
+          node -e "const m = require('@aether-ai/sdk'); console.log('CJS keys:', Object.keys(m).length); if (Object.keys(m).length === 0) { process.exit(1); }"
