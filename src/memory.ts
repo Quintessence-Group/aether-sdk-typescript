@@ -1,14 +1,17 @@
 import { AetherClient, type AetherClientOptions } from "./client.js";
 import { AetherError } from "./errors.js";
-import type { DocumentRecord } from "./models.js";
+import type {
+  DocumentRecord,
+  Metadata,
+  MetadataFilter,
+} from "./models.js";
 
 /**
  * A single remembered item, the shared result type for {@link Memory.remember},
  * {@link Memory.recall}, and {@link Memory.list}.
  *
- * > **`metadata` is intentionally not a field (write-only limitation).** The raw
- * > document API does not echo `tags` on any read model, so metadata written via
- * > {@link Memory.remember} cannot be read back in v1. See the README.
+ * `metadata` is the structured document metadata written by
+ * {@link Memory.remember} and echoed by the raw document API.
  */
 export interface MemoryItem {
   /** The underlying document id (`doc_id`). Always populated. */
@@ -23,6 +26,8 @@ export interface MemoryItem {
   createdAt?: string;
   /** The owning entity id (always equal to the Memory's `entityId`). */
   entityId?: string;
+  /** Structured metadata attached to the memory. */
+  metadata: Metadata;
   /**
    * Relevance signal, higher = more relevant. Populated by `recall` only.
    * **Relative within a single `recall` call; not comparable across calls.**
@@ -39,14 +44,15 @@ export type MemoryOptions = AetherClientOptions & {
   /**
    * Half-life (in days) for the recency-decay curve used by
    * {@link Memory.recall} when `recencyWeight > 0`. At one half-life the recency
-   * contribution is 0.5. Must be positive. Default: `30`.
+   * contribution is 0.5. Default: `30`.
    */
   halfLifeDays?: number;
   /**
-   * Reserved flag for future server-side fact extraction. **No-op in v1** — when
-   * `true`, `remember` behaves identically to `false` (stores the text as a
-   * single memory). Kept so a future extractor can split one `remember` into N
-   * fact-memories without a breaking change. Default: `false`.
+   * Default for {@link Memory.remember}'s server-side fact extraction.
+   * When `true`, `remember` distills the text into atomic facts stored as
+   * sibling `kind:fact` memories (overridable per call via `remember`'s
+   * `options.extract`). Requires fact extraction to be configured on the node.
+   * Default: `false`.
    */
   extractFacts?: boolean;
   /**
@@ -76,6 +82,8 @@ export interface RecallOptions {
   since?: string;
   /** Only recall memories created at or before this RFC 3339 timestamp (inclusive). */
   until?: string;
+  /** Structured metadata filter with equality or operator predicates. */
+  filter?: MetadataFilter;
 }
 
 /** Options for {@link Memory.list}. */
@@ -84,13 +92,266 @@ export interface MemoryListOptions {
   since?: string;
   /** Only list memories created at or before this RFC 3339 timestamp (inclusive). */
   until?: string;
+  /** Structured metadata filter with equality or operator predicates. */
+  filter?: MetadataFilter;
   /** Maximum number of memories to return, newest first. Default: `50`. */
   limit?: number;
 }
 
-// ── Recency re-rank tuning (MEMORY_CONTRACT.md §4 Mode B) ─────────────
-// Identical constants across all four SDKs so the contract test produces the
-// same ordering everywhere.
+// ── Memory graph (Part II, ADR-019) ───────────────────────────────────
+
+/**
+ * A scalar memory value: `attributes` entries and a fact `value`. The engine
+ * rejects nested objects/arrays (scalars only).
+ */
+export type ScalarValue = string | number | boolean | null;
+
+/** The subject a fact is about. */
+export type FactSubjectType = "owner" | "entity" | "relationship";
+
+/** A typed node in the owner's memory graph (`/v1/memory/entities`). */
+export interface MemoryEntity {
+  memoryEntityId: string;
+  /** The owner scope (= the Memory's `entityId`). */
+  entityId: string;
+  partition: string | null;
+  entityType: string;
+  displayName: string | null;
+  aliases: string[];
+  attributes: Record<string, ScalarValue>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A directed, typed edge between two entity nodes (`/v1/memory/relationships`). */
+export interface MemoryRelationship {
+  relationshipId: string;
+  entityId: string;
+  partition: string | null;
+  fromEntityId: string;
+  toEntityId: string;
+  relationshipType: string;
+  attributes: Record<string, ScalarValue>;
+  /** When the relationship became true, if known (RFC 3339). */
+  validFrom: string | null;
+  /** When Aether ingested it (RFC 3339). */
+  observedAt: string;
+  /** Null while active; set when retracted/superseded. */
+  invalidFrom: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A temporal fact with contradiction-resolution history (`/v1/memory/facts`). */
+export interface MemoryFact {
+  factId: string;
+  entityId: string;
+  partition: string | null;
+  subjectType: FactSubjectType;
+  subjectId: string | null;
+  predicate: string;
+  value: ScalarValue;
+  cardinality: "single" | "multi";
+  validFrom: string | null;
+  observedAt: string;
+  /** Null while active; set when superseded/retracted. */
+  invalidFrom: string | null;
+  supersedesFactId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Report returned by {@link Memory.consolidate} (`POST /v1/memory/consolidate`). */
+export interface ConsolidationReport {
+  activeFactsBefore: number;
+  activeFactsAfter: number;
+  retracted: number;
+}
+
+/** Options for {@link Memory.upsertEntity}. */
+export interface UpsertEntityOptions {
+  /** Existing id to update, or omit to mint a new entity. */
+  memoryEntityId?: string;
+  displayName?: string;
+  aliases?: string[];
+  attributes?: Record<string, ScalarValue>;
+}
+
+/** Options for {@link Memory.listEntities}. */
+export interface ListEntitiesOptions {
+  entityType?: string;
+  limit?: number;
+}
+
+/** Options for {@link Memory.relate}. */
+export interface RelateOptions {
+  relationshipId?: string;
+  attributes?: Record<string, ScalarValue>;
+  validFrom?: string;
+}
+
+/** Options for {@link Memory.listRelationships}. */
+export interface ListRelationshipsOptions {
+  fromEntityId?: string;
+  toEntityId?: string;
+  relationshipType?: string;
+  /** Include superseded/retracted edges. Default: `false`. */
+  includeInactive?: boolean;
+  /** RFC 3339 instant — return edges active as of this time. */
+  asOf?: string;
+  limit?: number;
+}
+
+/** Options for {@link Memory.rememberFact}. */
+export interface RememberFactOptions {
+  /** Default `"owner"`. */
+  subjectType?: FactSubjectType;
+  /** Required when `subjectType` is `entity` or `relationship`. */
+  subjectId?: string;
+  cardinality?: "single" | "multi";
+  validFrom?: string;
+  observedAt?: string;
+  supersedesFactId?: string;
+}
+
+/** Options for {@link Memory.listFacts}. */
+export interface ListFactsOptions {
+  subjectType?: FactSubjectType;
+  subjectId?: string;
+  predicate?: string;
+  includeInactive?: boolean;
+  asOf?: string;
+  limit?: number;
+}
+
+/** Options for {@link Memory.factHistory}. */
+export interface FactHistoryOptions {
+  /** Default `"owner"`. */
+  subjectType?: FactSubjectType;
+  /** Required when `subjectType` is `entity` or `relationship`. */
+  subjectId?: string;
+}
+
+// Wire shapes (snake_case, as the engine serializes them) → parsed to the
+// camelCase facade types above.
+interface EntityWire {
+  memory_entity_id: string;
+  entity_id: string;
+  partition: string | null;
+  entity_type: string;
+  display_name: string | null;
+  aliases: string[];
+  attributes: Record<string, ScalarValue>;
+  created_at: string;
+  updated_at: string;
+}
+interface RelationshipWire {
+  relationship_id: string;
+  entity_id: string;
+  partition: string | null;
+  from_entity_id: string;
+  to_entity_id: string;
+  relationship_type: string;
+  attributes: Record<string, ScalarValue>;
+  valid_from: string | null;
+  observed_at: string;
+  invalid_from: string | null;
+  created_at: string;
+  updated_at: string;
+}
+interface FactWire {
+  fact_id: string;
+  entity_id: string;
+  partition: string | null;
+  subject_type: FactSubjectType;
+  subject_id: string | null;
+  predicate: string;
+  value: ScalarValue;
+  cardinality: "single" | "multi";
+  valid_from: string | null;
+  observed_at: string;
+  invalid_from: string | null;
+  supersedes_fact_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function parseEntity(d: EntityWire): MemoryEntity {
+  return {
+    memoryEntityId: d.memory_entity_id,
+    entityId: d.entity_id,
+    partition: d.partition ?? null,
+    entityType: d.entity_type,
+    displayName: d.display_name ?? null,
+    aliases: d.aliases ?? [],
+    attributes: d.attributes ?? {},
+    createdAt: d.created_at,
+    updatedAt: d.updated_at,
+  };
+}
+function parseRelationship(d: RelationshipWire): MemoryRelationship {
+  return {
+    relationshipId: d.relationship_id,
+    entityId: d.entity_id,
+    partition: d.partition ?? null,
+    fromEntityId: d.from_entity_id,
+    toEntityId: d.to_entity_id,
+    relationshipType: d.relationship_type,
+    attributes: d.attributes ?? {},
+    validFrom: d.valid_from ?? null,
+    observedAt: d.observed_at,
+    invalidFrom: d.invalid_from ?? null,
+    createdAt: d.created_at,
+    updatedAt: d.updated_at,
+  };
+}
+function parseFact(d: FactWire): MemoryFact {
+  return {
+    factId: d.fact_id,
+    entityId: d.entity_id,
+    partition: d.partition ?? null,
+    subjectType: d.subject_type,
+    subjectId: d.subject_id ?? null,
+    predicate: d.predicate,
+    value: d.value ?? null,
+    cardinality: d.cardinality,
+    validFrom: d.valid_from ?? null,
+    observedAt: d.observed_at,
+    invalidFrom: d.invalid_from ?? null,
+    supersedesFactId: d.supersedes_fact_id ?? null,
+    createdAt: d.created_at,
+    updatedAt: d.updated_at,
+  };
+}
+
+const VALID_SUBJECT_TYPES: FactSubjectType[] = ["owner", "entity", "relationship"];
+
+/** Validate a (subjectType, subjectId) pair client-side (contract §13). */
+function validateSubject(
+  subjectType: FactSubjectType,
+  subjectId?: string,
+): [FactSubjectType, string | undefined] {
+  if (!VALID_SUBJECT_TYPES.includes(subjectType)) {
+    throw new AetherError(
+      "subjectType must be 'owner', 'entity', or 'relationship'",
+    );
+  }
+  if (subjectType === "owner") return ["owner", undefined];
+  if (!subjectId) {
+    throw new AetherError(
+      `subjectId is required when subjectType is '${subjectType}'`,
+    );
+  }
+  return [subjectType, subjectId];
+}
+
+function requireNonEmpty(name: string, value: string): void {
+  if (!value || value.trim().length === 0) {
+    throw new AetherError(`${name} is required`);
+  }
+}
+
+// ── Recency re-rank tuning (contract §4 Mode B) ───────────────────────
 const OVERFETCH = 4;
 const MAX_CANDIDATES = 100;
 
@@ -164,8 +425,8 @@ export class Memory {
    * @param entityId - The entity to scope all memories to (1–256 chars, non-empty).
    * @param options - Connection + Memory options. Pass `client` to inject a
    *   pre-built raw client (DI path); otherwise one is built from the options.
-   * @throws {AetherError} If `entityId` is empty or longer than 256 chars, or
-   *   `halfLifeDays` is not positive (client-side — never a network round-trip).
+   * @throws {AetherError} If `entityId` is empty or longer than 256 chars
+   *   (client-side — never a network round-trip).
    */
   constructor(entityId: string, options: MemoryOptions = {}) {
     if (!entityId || entityId.trim().length === 0) {
@@ -176,17 +437,9 @@ export class Memory {
         `entityId must be at most ${MAX_ENTITY_ID_LEN} characters`,
       );
     }
-    const halfLifeDays = options.halfLifeDays ?? 30;
-    if (halfLifeDays <= 0) {
-      throw new AetherError("halfLifeDays must be positive");
-    }
     this.entityId = entityId;
     this.client = options.client ?? new AetherClient(options);
-    this.halfLifeDays = halfLifeDays;
-    // `extractFacts` is a reserved no-op in v1: there is no server-side
-    // fact-extraction endpoint and this SDK carries no LLM dependency, so `true`
-    // behaves identically to `false`. The flag keeps the signature stable for a
-    // future extractor.
+    this.halfLifeDays = options.halfLifeDays ?? 30;
     this.extractFacts = options.extractFacts ?? false;
     this.now = options.now ?? (() => new Date());
   }
@@ -195,20 +448,20 @@ export class Memory {
    * Store one memory for the entity. **One HTTP call.**
    *
    * The text is inserted via `insertText`, scoped to this Memory's entity via the
-   * first-class `entity_id` field. `metadata` is encoded as searchable `key:value`
-   * tags (one per pair). Note this metadata is **write-only** in v1 — no read
-   * model echoes tags, so it cannot be read back (see the README).
+   * first-class `entity_id` field. `metadata` is sent as structured typed
+   * document metadata. For older tag-based callers, string-safe metadata is also
+   * mirrored into `key:value` tags where doing so is lossless.
    *
-   * `extractFacts` is a reserved no-op in v1: a future server-side extractor may
-   * split one `remember` into N fact-memories without a breaking change.
+   * Pass `options.extract` (or set `extractFacts` on the Memory) to also distill
+   * the text into atomic facts server-side; each fact is stored as a
+   * sibling `kind:fact` memory and is recallable like any other. The returned
+   * item is the raw memory, not the facts.
    *
    * @param text - The text to remember (must be non-empty / non-whitespace).
-   * @param metadata - Optional `{string: string}` map written as `key:value`
-   *   tags, emitted sorted by key so the wire string is byte-identical across
-   *   languages. **Values are strings only in v1.** A client-side argument error
-   *   is raised (before any HTTP call) for an empty key, a key containing `:` or
-   *   `,`, or a value containing `,` (the tag wire format is comma-joined and
-   *   cannot escape commas).
+   * @param metadata - Optional structured metadata. Values must be strings,
+   *   numbers, or booleans.
+   * @param options - Optional per-call settings. `options.extract` overrides the
+   *   Memory's `extractFacts` default for this call.
    * @returns A {@link MemoryItem} built from the returned document record.
    * @throws {AetherError} If `text` is empty/whitespace, or a metadata key is
    *   empty / contains `:` or `,`, or a value contains a comma (no HTTP call is
@@ -218,21 +471,27 @@ export class Memory {
    */
   async remember(
     text: string,
-    metadata?: Record<string, string>,
+    metadata?: Metadata,
+    options?: { extract?: boolean },
   ): Promise<MemoryItem> {
     if (!text || text.trim().length === 0) {
       throw new AetherError("text is required");
     }
-    const tags = this.encodeMetadata(metadata);
+    const tags = this.encodeLegacyMetadataTags(metadata);
+    // Per-call `extract` wins, else the Memory's `extractFacts` default.
+    const extract = options?.extract ?? this.extractFacts;
     const record = await this.client.insertText(text, {
       entityId: this.entityId,
       tags: tags.length > 0 ? tags : undefined,
+      metadata,
+      extractFacts: extract || undefined,
     });
     return {
       id: record.doc_id,
       text,
       createdAt: record.created_at,
-      entityId: record.entity_id ?? this.entityId,
+      entityId: this.entityId,
+      metadata: record.metadata ?? metadata ?? {},
     };
   }
 
@@ -240,7 +499,7 @@ export class Memory {
    * Semantic search scoped to the entity, with optional client-side recency decay.
    *
    * - **`recencyWeight === 0` (default):** one `retrieve` call; `createdAt` is
-   *   `undefined`, order is server order (best score first).
+   *   `undefined`, order is server order (closest first).
    * - **`recencyWeight > 0`:** overfetches candidates, resolves each candidate's
    *   `createdAt` via `get` (parallelized), and re-ranks by a deterministic blend
    *   of similarity and recency. Costs N+1 calls.
@@ -263,19 +522,22 @@ export class Memory {
     const recencyWeight = Math.min(1, Math.max(0, options?.recencyWeight ?? 0));
     const since = options?.since;
     const until = options?.until;
+    const filter = options?.filter;
 
-    // ── Mode A: pure similarity (1 search + N downloads) ──────────────
+    // ── Mode A: pure similarity (1 call) ──────────────────────────────
     if (recencyWeight === 0) {
       const hits = await this.client.retrieve(query, k, {
         entityId: this.entityId,
         since,
         until,
+        filter,
       });
       return hits.map((h) => ({
         id: h.doc_id,
         text: h.content,
         createdAt: undefined,
         entityId: this.entityId,
+        metadata: h.metadata ?? {},
         score: similarity(h.score),
       }));
     }
@@ -284,7 +546,7 @@ export class Memory {
     const candidates = await this.client.retrieve(
       query,
       Math.min(k * OVERFETCH, MAX_CANDIDATES),
-      { entityId: this.entityId, since, until },
+      { entityId: this.entityId, since, until, filter },
     );
     if (candidates.length === 0) return [];
 
@@ -318,6 +580,7 @@ export class Memory {
       text: s.c.content,
       createdAt: s.createdAt,
       entityId: this.entityId,
+      metadata: s.c.metadata ?? {},
       score: s.blended,
     }));
   }
@@ -343,6 +606,7 @@ export class Memory {
       entityId: this.entityId,
       since: options?.since,
       until: options?.until,
+      filter: options?.filter,
       limit,
     });
     const capped = documents.slice(0, limit);
@@ -354,7 +618,57 @@ export class Memory {
       text: texts[i],
       createdAt: r.created_at,
       entityId: r.entity_id ?? this.entityId,
+      metadata: r.metadata ?? {},
     }));
+  }
+
+  /**
+   * Return this entity's consolidated **extracted** facts (`kind:fact` memories),
+   * highest corroborated confidence first.
+   *
+   * These are the free-text facts produced by `remember(text, metadata, {
+   * extract: true })` and deduped server-side — distinct from the structured
+   * memory-graph facts returned by {@link listFacts}. This is the clean,
+   * high-signal view of what's known about the entity: one entry per distinct
+   * fact, most-corroborated (then most-recent) first. Cost is 1 + N (one listing
+   * plus a content download per fact).
+   *
+   * @param options - `limit` caps the number of facts (default 50).
+   */
+  async listExtractedFacts(options?: { limit?: number }): Promise<MemoryItem[]> {
+    const limit = options?.limit ?? 50;
+    const { documents } = await this.client.list({
+      entityId: this.entityId,
+      tags: ["kind:fact"],
+      limit,
+    });
+    const sorted = [...documents].sort((a, b) => {
+      const dc = Memory.factConfidence(b.tags) - Memory.factConfidence(a.tags);
+      if (dc !== 0) return dc;
+      return (b.created_at ?? "").localeCompare(a.created_at ?? "");
+    });
+    const capped = sorted.slice(0, limit);
+    const texts = await Promise.all(
+      capped.map((r) => this.client.downloadText(r.doc_id)),
+    );
+    return capped.map((r, i) => ({
+      id: r.doc_id,
+      text: texts[i],
+      createdAt: r.created_at,
+      entityId: r.entity_id ?? this.entityId,
+      metadata: r.metadata ?? {},
+    }));
+  }
+
+  /** Confidence (corroborating-source count) from a fact's `conf:` tag; 1 default. */
+  private static factConfidence(tags: string[] | undefined): number {
+    for (const t of tags ?? []) {
+      if (t.startsWith("conf:")) {
+        const n = parseInt(t.slice("conf:".length), 10);
+        return Number.isFinite(n) && n > 0 ? n : 1;
+      }
+    }
+    return 1;
   }
 
   /**
@@ -395,28 +709,226 @@ export class Memory {
     return deleted;
   }
 
+  // ── Memory graph (Part II) ────────────────────────────────────────
+
+  /** Scoped `/v1/memory/*` request: stamps the owner `entity_id` (partition is
+   * injected by the client). */
+  private graphRequest<T>(
+    method: string,
+    path: string,
+    query: Record<string, string | number | boolean>,
+    body?: unknown,
+  ): Promise<T> {
+    return this.client.memoryRequest<T>(
+      method,
+      path,
+      { ...query, entity_id: this.entityId },
+      body,
+    );
+  }
+
   /**
-   * Encode a metadata map as `key:value` tag strings (one per pair), **sorted by
-   * key ascending** so the wire string is byte-identical across languages. The
-   * first `:` separates key from value, so values may contain `:` but **not** `,`.
-   *
-   * Raises a client-side argument error (before any HTTP call) for an empty key,
-   * a key containing `:` or `,`, or a value containing `,`.
+   * Create or update a typed entity node in this owner's graph. Omit
+   * `memoryEntityId` to mint a new node; pass one (or an idempotency key) to
+   * update. `attributes` values must be scalar.
    */
-  private encodeMetadata(metadata?: Record<string, string>): string[] {
+  async upsertEntity(
+    entityType: string,
+    options: UpsertEntityOptions = {},
+  ): Promise<MemoryEntity> {
+    requireNonEmpty("entityType", entityType);
+    const body: Record<string, unknown> = { entity_type: entityType };
+    if (options.memoryEntityId) body.memory_entity_id = options.memoryEntityId;
+    if (options.displayName !== undefined) body.display_name = options.displayName;
+    if (options.aliases !== undefined) body.aliases = options.aliases;
+    if (options.attributes !== undefined) body.attributes = options.attributes;
+    return parseEntity(
+      await this.graphRequest<EntityWire>("POST", "/memory/entities", {}, body),
+    );
+  }
+
+  /** Fetch one entity node by id. */
+  async getEntity(memoryEntityId: string): Promise<MemoryEntity> {
+    requireNonEmpty("memoryEntityId", memoryEntityId);
+    return parseEntity(
+      await this.graphRequest<EntityWire>(
+        "GET",
+        `/v1/memory/entities/${encodeURIComponent(memoryEntityId)}`,
+        {},
+      ),
+    );
+  }
+
+  /** List this owner's entity nodes, optionally filtered by `entityType`. */
+  async listEntities(options: ListEntitiesOptions = {}): Promise<MemoryEntity[]> {
+    const query: Record<string, string | number | boolean> = {};
+    if (options.entityType) query.entity_type = options.entityType;
+    if (options.limit !== undefined) query.limit = options.limit;
+    const r = await this.graphRequest<{ entities: EntityWire[]; count: number }>(
+      "GET",
+      "/memory/entities",
+      query,
+    );
+    return r.entities.map(parseEntity);
+  }
+
+  /** Create or update a directed edge between two entity nodes. */
+  async relate(
+    fromEntityId: string,
+    toEntityId: string,
+    relationshipType: string,
+    options: RelateOptions = {},
+  ): Promise<MemoryRelationship> {
+    requireNonEmpty("fromEntityId", fromEntityId);
+    requireNonEmpty("toEntityId", toEntityId);
+    requireNonEmpty("relationshipType", relationshipType);
+    const body: Record<string, unknown> = {
+      from_entity_id: fromEntityId,
+      to_entity_id: toEntityId,
+      relationship_type: relationshipType,
+    };
+    if (options.relationshipId) body.relationship_id = options.relationshipId;
+    if (options.attributes !== undefined) body.attributes = options.attributes;
+    if (options.validFrom !== undefined) body.valid_from = options.validFrom;
+    return parseRelationship(
+      await this.graphRequest<RelationshipWire>(
+        "POST",
+        "/memory/relationships",
+        {},
+        body,
+      ),
+    );
+  }
+
+  /** List edges, optionally filtered. `asOf` returns edges active at that instant. */
+  async listRelationships(
+    options: ListRelationshipsOptions = {},
+  ): Promise<MemoryRelationship[]> {
+    const query: Record<string, string | number | boolean> = {};
+    if (options.fromEntityId) query.from_entity_id = options.fromEntityId;
+    if (options.toEntityId) query.to_entity_id = options.toEntityId;
+    if (options.relationshipType) query.relationship_type = options.relationshipType;
+    if (options.includeInactive) query.include_inactive = "true";
+    if (options.asOf) query.as_of = options.asOf;
+    if (options.limit !== undefined) query.limit = options.limit;
+    const r = await this.graphRequest<{
+      relationships: RelationshipWire[];
+      count: number;
+    }>("GET", "/memory/relationships", query);
+    return r.relationships.map(parseRelationship);
+  }
+
+  /**
+   * Assert a temporal fact about the owner (default), an entity, or a
+   * relationship. A newer single-valued fact with the same (subject, predicate)
+   * supersedes the prior one server-side, keeping it in history. `value` must be
+   * scalar.
+   */
+  async rememberFact(
+    predicate: string,
+    value: ScalarValue,
+    options: RememberFactOptions = {},
+  ): Promise<MemoryFact> {
+    requireNonEmpty("predicate", predicate);
+    const [subjectType, subjectId] = validateSubject(
+      options.subjectType ?? "owner",
+      options.subjectId,
+    );
+    const body: Record<string, unknown> = {
+      subject_type: subjectType,
+      predicate,
+      value,
+    };
+    if (subjectId !== undefined) body.subject_id = subjectId;
+    if (options.cardinality !== undefined) body.cardinality = options.cardinality;
+    if (options.validFrom !== undefined) body.valid_from = options.validFrom;
+    if (options.observedAt !== undefined) body.observed_at = options.observedAt;
+    if (options.supersedesFactId) body.supersedes_fact_id = options.supersedesFactId;
+    return parseFact(
+      await this.graphRequest<FactWire>("POST", "/memory/facts", {}, body),
+    );
+  }
+
+  /** List active facts (default), or include superseded/retracted with `includeInactive`. */
+  async listFacts(options: ListFactsOptions = {}): Promise<MemoryFact[]> {
+    const query: Record<string, string | number | boolean> = {};
+    if (options.subjectType !== undefined) {
+      const [subjectType, subjectId] = validateSubject(
+        options.subjectType,
+        options.subjectId,
+      );
+      query.subject_type = subjectType;
+      if (subjectId !== undefined) query.subject_id = subjectId;
+    }
+    if (options.predicate) query.predicate = options.predicate;
+    if (options.includeInactive) query.include_inactive = "true";
+    if (options.asOf) query.as_of = options.asOf;
+    if (options.limit !== undefined) query.limit = options.limit;
+    const r = await this.graphRequest<{ facts: FactWire[]; count: number }>(
+      "GET",
+      "/memory/facts",
+      query,
+    );
+    return r.facts.map(parseFact);
+  }
+
+  /** Full assertion chain (active + superseded) for one (subject, predicate). */
+  async factHistory(
+    predicate: string,
+    options: FactHistoryOptions = {},
+  ): Promise<MemoryFact[]> {
+    requireNonEmpty("predicate", predicate);
+    const [subjectType, subjectId] = validateSubject(
+      options.subjectType ?? "owner",
+      options.subjectId,
+    );
+    const query: Record<string, string | number | boolean> = {
+      history: "true",
+      subject_type: subjectType,
+      predicate,
+    };
+    if (subjectId !== undefined) query.subject_id = subjectId;
+    const r = await this.graphRequest<{ facts: FactWire[]; count: number }>(
+      "GET",
+      "/memory/facts",
+      query,
+    );
+    return r.facts.map(parseFact);
+  }
+
+  /** Soft-retract redundant facts in this scope; returns a report. */
+  async consolidate(): Promise<ConsolidationReport> {
+    const r = await this.graphRequest<{
+      active_facts_before: number;
+      active_facts_after: number;
+      retracted: number;
+    }>("POST", "/memory/consolidate", {});
+    return {
+      activeFactsBefore: r.active_facts_before,
+      activeFactsAfter: r.active_facts_after,
+      retracted: r.retracted,
+    };
+  }
+
+  /**
+   * Best-effort legacy tag mirror for old `Memory.remember(..., metadata)`
+   * callers. Structured metadata is authoritative; tags are emitted only when
+   * the old comma-joined `key:value` format can represent the pair losslessly.
+   */
+  private encodeLegacyMetadataTags(metadata?: Metadata): string[] {
     if (!metadata) return [];
     const tags: string[] = [];
     for (const key of Object.keys(metadata).sort()) {
       if (key.length === 0) {
         throw new AetherError("metadata key must not be empty");
       }
+      const value = metadata[key];
       if (key.includes(":") || key.includes(",")) {
         throw new AetherError(
           `metadata key "${key}" must not contain ':' or ','`,
         );
       }
-      const value = metadata[key];
-      if (value.includes(",")) {
+      if (String(value).includes(",")) {
         throw new AetherError(
           `metadata value for "${key}" must not contain a comma`,
         );

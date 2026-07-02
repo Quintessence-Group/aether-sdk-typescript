@@ -90,9 +90,10 @@ export function formatContext(
   const chunks: string[] = [];
   results.forEach((r, idx) => {
     const passage = r.passage ?? "";
-    // `content` (full document text) is present only on RetrievalResult, which
-    // `retrieve()` returns; plain `search()` results carry just the passage.
-    const content = "content" in r ? r.content : "";
+    // `content` (full document text) is always present on RetrievalResult,
+    // which `retrieve()` returns; plain `search()` results may omit it and
+    // carry just the matched passage.
+    const content = ("content" in r ? r.content : "") ?? "";
     const text = preferPassage ? passage || content : content || passage;
     chunks.push(
       renderTemplate(template, {

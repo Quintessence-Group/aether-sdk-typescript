@@ -8,17 +8,47 @@
     ".": {
       "import": {
         "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
+        "default": "./dist/index.mjs"
       },
       "require": {
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./integrations/langchain": {
+      "import": {
+        "types": "./dist/integrations/langchain.d.ts",
+        "default": "./dist/integrations/langchain.mjs"
+      },
+      "require": {
+        "types": "./dist/integrations/langchain.d.cts",
+        "default": "./dist/integrations/langchain.cjs"
+      }
+    },
+    "./integrations/llamaindex": {
+      "import": {
+        "types": "./dist/integrations/llamaindex.d.ts",
+        "default": "./dist/integrations/llamaindex.mjs"
+      },
+      "require": {
+        "types": "./dist/integrations/llamaindex.d.cts",
+        "default": "./dist/integrations/llamaindex.cjs"
+      }
     }
   },
   "main": "./dist/index.cjs",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.cts",
+  "typesVersions": {
+    "*": {
+      "integrations/langchain": [
+        "./dist/integrations/langchain.d.cts"
+      ],
+      "integrations/llamaindex": [
+        "./dist/integrations/llamaindex.d.cts"
+      ]
+    }
+  },
   "files": [
     "dist"
   ],
@@ -54,8 +84,22 @@
   "engines": {
     "node": ">=18"
   },
+  "peerDependencies": {
+    "@langchain/core": ">=0.2.0 <2",
+    "@llamaindex/core": ">=0.6.0 <1"
+  },
+  "peerDependenciesMeta": {
+    "@langchain/core": {
+      "optional": true
+    },
+    "@llamaindex/core": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.3",
+    "@langchain/core": "^1.2.1",
+    "@llamaindex/core": "^0.6.22",
     "@types/node": "^25.5.2",
     "publint": "^0.3.21",
     "tsup": "^8.0.0",

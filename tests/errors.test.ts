@@ -106,6 +106,81 @@ describe("aetherApiErrorFromResponse", () => {
   });
 });
 
+// ── Canonical billing-rejection fixtures ─────────────────────────────────
+// These are the exact wire bodies the engine emits for billing/operator
+// rejections. The factory must map each (status, code) pair to its typed
+// subclass with `.errorCode`, `.status`, and `.body` populated, and fall back
+// to the base `AetherApiError` for an unrecognized code.
+
+describe("aetherApiErrorFromResponse — canonical billing fixtures", () => {
+  it("maps 402 credit_exhausted to CreditExhaustedError", () => {
+    const body = {
+      error: "Prepaid credit balance exhausted; top up to continue.",
+      code: "credit_exhausted",
+    };
+    const err = aetherApiErrorFromResponse(402, "Payment Required", body);
+    expect(err).toBeInstanceOf(CreditExhaustedError);
+    expect(err).toBeInstanceOf(AetherApiError);
+    expect(err).toBeInstanceOf(AetherError);
+    expect(err).not.toBeInstanceOf(FreeLimitExceededError);
+    expect(err.status).toBe(402);
+    expect(err.errorCode).toBe("credit_exhausted");
+    expect(err.body).toEqual(body);
+    expect(err.message).toBe(
+      "Prepaid credit balance exhausted; top up to continue.",
+    );
+  });
+
+  it("maps 402 free_limit_exceeded to FreeLimitExceededError", () => {
+    const body = {
+      error: "Free vector limit exceeded (1001/1000)",
+      code: "free_limit_exceeded",
+    };
+    const err = aetherApiErrorFromResponse(402, "Payment Required", body);
+    expect(err).toBeInstanceOf(FreeLimitExceededError);
+    expect(err).toBeInstanceOf(AetherApiError);
+    expect(err).toBeInstanceOf(AetherError);
+    // Sibling subclass, not a credit-exhaustion failure.
+    expect(err).not.toBeInstanceOf(CreditExhaustedError);
+    expect(err.status).toBe(402);
+    expect(err.errorCode).toBe("free_limit_exceeded");
+    expect(err.body).toEqual(body);
+    expect(err.message).toBe("Free vector limit exceeded (1001/1000)");
+  });
+
+  it("maps 403 tenant_paused to TenantPausedError", () => {
+    const body = {
+      error: "Tenant has been paused by the operator",
+      code: "tenant_paused",
+    };
+    const err = aetherApiErrorFromResponse(403, "Forbidden", body);
+    expect(err).toBeInstanceOf(TenantPausedError);
+    expect(err).toBeInstanceOf(AetherApiError);
+    expect(err).toBeInstanceOf(AetherError);
+    expect(err.status).toBe(403);
+    expect(err.errorCode).toBe("tenant_paused");
+    expect(err.body).toEqual(body);
+    expect(err.message).toBe("Tenant has been paused by the operator");
+  });
+
+  it("falls back to base AetherApiError for an unknown billing code", () => {
+    const body = {
+      error: "Some new billing rejection we don't model yet",
+      code: "some_unknown_code",
+    };
+    const err = aetherApiErrorFromResponse(402, "Payment Required", body);
+    // Exactly the base class — none of the typed subclasses.
+    expect(err).toBeInstanceOf(AetherApiError);
+    expect(err.constructor).toBe(AetherApiError);
+    expect(err).not.toBeInstanceOf(CreditExhaustedError);
+    expect(err).not.toBeInstanceOf(FreeLimitExceededError);
+    expect(err).not.toBeInstanceOf(TenantPausedError);
+    expect(err.status).toBe(402);
+    expect(err.errorCode).toBe("some_unknown_code");
+    expect(err.body).toEqual(body);
+  });
+});
+
 describe("AetherNetworkError", () => {
   it("extends AetherError with cause", () => {
     const cause = new TypeError("fetch failed");

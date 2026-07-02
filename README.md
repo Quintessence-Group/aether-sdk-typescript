@@ -55,13 +55,14 @@ interface MemoryItem {
   text: string;        // the remembered text
   createdAt?: string;  // RFC 3339; set by remember/list, and by recall when recencyWeight > 0
   entityId?: string;   // always this Memory's entity
+  metadata: Metadata;  // structured metadata, echoed back on recall/list
   score?: number;      // relevance signal (recall only); higher = more relevant
 }
 ```
 
-> **Note:** `metadata` is **write-only** in v1. It is stored as searchable tags
-> but the read models do not echo tags back, so it cannot currently be read off a
-> `MemoryItem`.
+> **Note:** `metadata` (`Record<string, string | number | boolean>`) is stored
+> with each memory and echoed back on `recall` and `list`. You can also filter
+> on it at query time via `recall(query, { filter })`.
 
 For lower-level control — raw documents, BYO embeddings, batching, async jobs —
 use the [`AetherClient`](#quick-start) directly.

@@ -72,6 +72,20 @@ export class TenantPausedError extends AetherApiError {
 }
 
 /**
+ * Thrown when a multi-tenant key makes an unscoped call (HTTP 400,
+ * `code: "partition_required"`). The key requires every read and write to name
+ * a partition; scope the call through a partition handle —
+ * `client.partition("<end-client-id>")` — instead of the top-level client.
+ * Not retryable: it is a programming error, not a transient failure.
+ */
+export class PartitionRequiredError extends AetherApiError {
+  constructor(status: number, statusText: string, body: AetherErrorBody) {
+    super(status, statusText, body);
+    this.name = "PartitionRequiredError";
+  }
+}
+
+/**
  * Build the most-specific `AetherApiError` subclass for the given response.
  * The factory inspects the structured `code` field (Phase 8 / ADR-015 wire
  * shape); unknown codes fall back to the base `AetherApiError`.
@@ -89,6 +103,9 @@ export function aetherApiErrorFromResponse(
   }
   if (status === 403 && body.code === "tenant_paused") {
     return new TenantPausedError(status, statusText, body);
+  }
+  if (status === 400 && body.code === "partition_required") {
+    return new PartitionRequiredError(status, statusText, body);
   }
   return new AetherApiError(status, statusText, body);
 }
