@@ -1,22 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AetherClient } from "../src/client.js";
-import { CreditExhaustedError } from "../src/errors.js";
-import { Memory, type MemoryItem } from "../src/memory.js";
+import { Memory } from "../src/memory.js";
+import {
+  AetherApiError,
+  AetherError,
+  CreditExhaustedError,
+} from "../src/errors.js";
 
-/**
- * Contract test for the {@link Memory} facade.
- *
- * Mocked at the same transport layer as the existing client tests
- * (`vi.stubGlobal("fetch", ...)`) with the *real* raw client underneath,
- * constructed via the DI path (`new Memory(entityId, { client })`).
- *
- * This pins the facade to the **shipped 0.3.x search surface**: hits carry a
- * calibrated `score` (0–100, higher = better) and a `passage` — there is no
- * `distance` field, and `recall` fetches each matched document's text with a
- * follow-up `GET /documents/{id}/download` (search no longer inlines content).
- */
-
-const FIXED_NOW = new Date("2026-06-15T00:00:00Z");
+// ── Transport mock (same layer as tests/client.test.ts) ───────────────
+// We mock the global `fetch` and construct Memory around a REAL AetherClient
+// (DI path, contract §1) so the actual client code runs end-to-end. We never
+// mock Memory's own methods.
 
 const mockFetch = vi.fn();
 
@@ -27,8 +21,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
 });
-
-// ── response builders ────────────────────────────────────────────────
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -45,405 +37,930 @@ function binaryResponse(text: string): Response {
   });
 }
 
-function insertResp(
-  docId = "doc-new",
-  createdAt = "2026-06-15T00:00:00Z",
-  entityId = "user-42",
+/** A search/retrieve `{query, results}` envelope with inlined content so the
+ *  raw `retrieve` does not issue extra download calls. */
+function retrieveResponse(
+  results: Array<{ doc_id: string; distance: number; content: string }>,
 ): Response {
   return jsonResponse({
-    doc_id: docId,
-    cid: "cid-1",
-    chunks: 1,
-    vectors: 1,
-    version: 1,
-    created_at: createdAt,
-    entity_id: entityId,
+    query: "q",
+    results: results.map((r) => ({
+      ...r,
+      content_type: "text/plain",
+    })),
   });
 }
 
-function hit(docId: string, score: number, passage = "p") {
-  return { doc_id: docId, score, content_type: "text/plain", passage };
-}
-
-function searchResp(results: unknown[]): Response {
-  // 0.3.x wire shape: score + passage, no distance, no content.
-  return jsonResponse({ query: "q", results });
-}
-
-function docResp(docId: string, createdAt: string | null): Response {
-  return jsonResponse({
-    doc_id: docId,
-    cid: "c",
-    content_type: "text/plain",
-    size_bytes: 1,
-    version: 1,
-    created_at: createdAt,
-    entity_id: "user-42",
-  });
-}
-
-function listResp(documents: unknown[]): Response {
-  return jsonResponse({
-    documents,
-    count: documents.length,
-    total: documents.length,
-    offset: 0,
-    limit: documents.length,
-    has_more: false,
-  });
-}
-
-// ── routing transport ────────────────────────────────────────────────
-//
-// `fetch` is called as `fetch(url, init)`. We dispatch a scripted response keyed
-// by `(method, path)`. A list value pops one response per call (FIFO); a single
-// `Response` is reused. Records every call so tests can assert URL/params.
-
-type RouteValue = Response | Response[];
-interface RecordedCall {
-  method: string;
-  url: string;
-  init: RequestInit;
-}
-
-class Transport {
-  readonly calls: RecordedCall[] = [];
-  constructor(private readonly routes: Record<string, RouteValue>) {}
-
-  handler = (url: string, init?: RequestInit): Promise<Response> => {
-    const method = (init?.method ?? "GET").toUpperCase();
-    this.calls.push({ method, url, init: init ?? {} });
-    const path = url.split("?", 1)[0].replace(/^https?:\/\/[^/]+/, "");
-    const key = `${method} ${path}`;
-    const value = this.routes[key];
-    if (value === undefined) {
-      throw new Error(`unexpected request: ${method} ${path} (${url})`);
-    }
-    const resp = Array.isArray(value) ? value.shift()! : value;
-    return Promise.resolve(resp);
-  };
-
-  callsTo(method: string, path: string): RecordedCall[] {
-    return this.calls.filter(
-      (c) =>
-        c.method === method.toUpperCase() &&
-        c.url.split("?", 1)[0].replace(/^https?:\/\/[^/]+/, "") === path,
-    );
-  }
-}
-
-function makeMemory(
-  transport: Transport,
-  entityId = "user-42",
-  opts: Record<string, unknown> = {},
-): Memory {
-  mockFetch.mockImplementation(transport.handler);
+function newMemory(entityId = "patient-john", opts = {}): Memory {
   const client = new AetherClient({
     baseUrl: "http://localhost:9000",
-    apiKey: "k",
+    apiKey: "aether_testkey123",
     maxRetries: 0,
   });
-  return new Memory(entityId, { client, now: () => FIXED_NOW, ...opts });
+  return new Memory(entityId, { client, ...opts });
 }
 
-// ── scoping ──────────────────────────────────────────────────────────
+/** Parse the URL + init of the Nth fetch call. */
+function call(n: number): { url: string; init: RequestInit } {
+  const [url, init] = mockFetch.mock.calls[n];
+  return { url: url as string, init: init as RequestInit };
+}
 
-describe("scoping", () => {
-  it("remember sends entity_id as a query param", async () => {
-    const t = new Transport({ "POST /documents": insertResp() });
-    await makeMemory(t).remember("hello");
-    const [post] = t.callsTo("POST", "/documents");
-    expect(post.url).toContain("entity_id=user-42");
-  });
-
-  it("recall sends entity_id filter on /search", async () => {
-    const t = new Transport({ "GET /search": searchResp([]) });
-    await makeMemory(t).recall("anxiety");
-    const [search] = t.callsTo("GET", "/search");
-    expect(search.url).toContain("entity_id=user-42");
-  });
-
-  it("list sends entity_id filter on /documents", async () => {
-    const t = new Transport({ "GET /documents": listResp([]) });
-    await makeMemory(t).list();
-    const [list] = t.callsTo("GET", "/documents");
-    expect(list.url).toContain("entity_id=user-42");
-  });
-});
-
-// ── remember round-trip ──────────────────────────────────────────────
-
-describe("remember round-trip", () => {
-  it("returns a MemoryItem with score undefined", async () => {
-    const t = new Transport({
-      "POST /documents": insertResp("doc-7", "2026-06-15T09:30:00Z"),
-    });
-    const item = await makeMemory(t).remember("anxious about flying");
-    expect(item.id).toBe("doc-7");
-    expect(item.text).toBe("anxious about flying");
-    expect(item.entityId).toBe("user-42");
-    expect(item.score).toBeUndefined();
-    expect(item.createdAt).toBe("2026-06-15T09:30:00Z");
-  });
-
-  it("empty text is a client-side error (no HTTP)", async () => {
-    const t = new Transport({});
-    await expect(makeMemory(t).remember("   ")).rejects.toThrow();
-    expect(t.calls).toHaveLength(0);
-  });
-});
-
-// ── metadata → tags (write-only) ─────────────────────────────────────
-
-describe("metadata tags", () => {
-  it("encodes metadata as a key:value tag", async () => {
-    const t = new Transport({ "POST /documents": insertResp() });
-    await makeMemory(t).remember("breathing helps", { topic: "anxiety" });
-    expect(t.calls[0].url).toContain("tags=topic%3Aanxiety");
-  });
-
-  it("sorts multiple tags by key", async () => {
-    const t = new Transport({ "POST /documents": insertResp() });
-    await makeMemory(t).remember("x", {
-      topic: "anxiety",
-      score: "5",
-      active: "yes",
-    });
-    expect(t.calls[0].url).toContain(
-      "tags=active%3Ayes%2Cscore%3A5%2Ctopic%3Aanxiety",
-    );
-  });
-
-  it("sorts by key, not by the rendered tag", async () => {
-    const t = new Transport({ "POST /documents": insertResp() });
-    await makeMemory(t).remember("x", { a0: "w", a: "v" });
-    expect(t.calls[0].url).toContain("tags=a%3Av%2Ca0%3Aw");
-  });
-
-  it("splits on the first colon so values may contain ':'", async () => {
-    const t = new Transport({ "POST /documents": insertResp() });
-    await makeMemory(t).remember("x", { time: "12:30" });
-    expect(t.calls[0].url).toContain("tags=time%3A12%3A30");
-  });
-
-  it.each([
-    { topic: "a,b" },
-    { "": "v" },
-    { "a,b": "v" },
-    { "a:b": "v" },
-  ])("rejects bad metadata with no HTTP: %o", async (metadata) => {
-    const t = new Transport({});
-    await expect(
-      makeMemory(t).remember("x", metadata as Record<string, string>),
-    ).rejects.toThrow();
-    expect(t.calls).toHaveLength(0);
-  });
-});
-
-// ── recall (default: recencyWeight = 0) ──────────────────────────────
-
-describe("recall (default)", () => {
-  it("searches then downloads in server order; score = wire/100", async () => {
-    const t = new Transport({
-      "GET /search": searchResp([hit("d1", 95), hit("d2", 70)]),
-      "GET /documents/d1/download": binaryResponse("first"),
-      "GET /documents/d2/download": binaryResponse("second"),
-    });
-    const items = await makeMemory(t).recall("query", { k: 5 });
-
-    // one search + one download per unique hit; NO metadata get() calls
-    expect(t.callsTo("GET", "/search")).toHaveLength(1);
-    expect(t.callsTo("GET", "/documents/d1/download")).toHaveLength(1);
-    expect(t.callsTo("GET", "/documents/d2/download")).toHaveLength(1);
-    expect(t.callsTo("GET", "/documents/d1")).toHaveLength(0);
-
-    expect(items.map((i) => i.id)).toEqual(["d1", "d2"]);
-    expect(items.map((i) => i.text)).toEqual(["first", "second"]);
-    expect(items.every((i) => i.createdAt === undefined)).toBe(true);
-
-    // score normalized from the 0–100 wire score; higher = better
-    expect(items[0].score).toBeCloseTo(0.95, 10);
-    expect(items[1].score).toBeCloseTo(0.7, 10);
-
-    // entity filter + k forwarded; no removed include_content flag
-    const url = t.callsTo("GET", "/search")[0].url;
-    expect(url).not.toContain("include_content");
-    expect(url).toContain("entity_id=user-42");
-    expect(url).toContain("k=5");
-  });
-
-  it("empty query is a client-side error (no HTTP)", async () => {
-    const t = new Transport({});
-    await expect(makeMemory(t).recall("   ")).rejects.toThrow();
-    expect(t.calls).toHaveLength(0);
-  });
-
-  it("k < 1 is a client-side error (no HTTP)", async () => {
-    const t = new Transport({});
-    await expect(makeMemory(t).recall("query", { k: 0 })).rejects.toThrow();
-    expect(t.calls).toHaveLength(0);
-  });
-});
-
-// ── recall (recencyWeight > 0: blended re-ranking) ───────────────────
-//
-// recencyWeight=0.5, halfLifeDays=30, now=2026-06-15. similarity = score/100,
-// recency = 0.5 ** (ageDays / 30). blended = 0.5*sim + 0.5*recency:
-//   docA score=90  age=0d   -> 0.5*0.90 + 0.5*1.0 = 0.95
-//   docB score=80  age=30d  -> 0.5*0.80 + 0.5*0.5 = 0.65
-//   docC score=100 created=null (recency 0) -> 0.5*1.00 + 0.5*0.0 = 0.50
-// Pure score order is [docC, docA, docB]; recency reorders to [docA, docB, docC].
-
-describe("recall (recency blend)", () => {
-  function recencyTransport(): Transport {
-    return new Transport({
-      "GET /search": searchResp([
-        hit("docA", 90),
-        hit("docB", 80),
-        hit("docC", 100),
-      ]),
-      "GET /documents/docA/download": binaryResponse("A"),
-      "GET /documents/docB/download": binaryResponse("B"),
-      "GET /documents/docC/download": binaryResponse("C"),
-      "GET /documents/docA": docResp("docA", "2026-06-15T00:00:00Z"),
-      "GET /documents/docB": docResp("docB", "2026-05-16T00:00:00Z"),
-      "GET /documents/docC": docResp("docC", null),
-    });
-  }
-
-  it("re-orders by the blended score and populates createdAt", async () => {
-    const items = await makeMemory(recencyTransport()).recall("q", {
-      k: 5,
-      recencyWeight: 0.5,
-    });
-    expect(items.map((i) => i.id)).toEqual(["docA", "docB", "docC"]);
-    expect(items[0].score).toBeCloseTo(0.95, 10);
-    expect(items[1].score).toBeCloseTo(0.65, 10);
-    expect(items[2].score).toBeCloseTo(0.5, 10);
-    expect(items[0].createdAt).toBe("2026-06-15T00:00:00Z");
-  });
-
-  it("truncates to the top k after re-ranking", async () => {
-    const items = await makeMemory(recencyTransport()).recall("q", {
-      k: 2,
-      recencyWeight: 0.5,
-    });
-    expect(items.map((i) => i.id)).toEqual(["docA", "docB"]);
-  });
-});
-
-// ── list (chronological) ─────────────────────────────────────────────
-
-describe("list", () => {
-  it("returns newest-first with text downloaded and score undefined", async () => {
-    const t = new Transport({
-      "GET /documents": listResp([
-        {
-          doc_id: "m1",
+describe("Memory", () => {
+  // ── §8.1 scoping ────────────────────────────────────────────────────
+  describe("scoping (§8.1)", () => {
+    it("remember sends the configured entity_id as the entity_id field", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "doc-1",
+          cid: "",
           content_type: "text/plain",
+          size_bytes: 10,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
           created_at: "2026-06-15T00:00:00Z",
-        },
-        {
-          doc_id: "m2",
+        }),
+      );
+      const mem = newMemory("patient-john");
+      await mem.remember("hello");
+      const { url } = call(0);
+      expect(url).toContain("entity_id=patient-john");
+    });
+
+    it("recall sends entity_id as the filter", async () => {
+      mockFetch.mockResolvedValueOnce(
+        retrieveResponse([{ doc_id: "d", distance: 0.2, content: "x" }]),
+      );
+      const mem = newMemory("patient-john");
+      await mem.recall("anxiety");
+      const { url } = call(0);
+      expect(url).toContain("/v1/search?");
+      expect(url).toContain("entity_id=patient-john");
+    });
+
+    it("list sends entity_id as the filter", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ documents: [], count: 0, total: 0, has_more: false }),
+      );
+      const mem = newMemory("patient-john");
+      await mem.list();
+      const { url } = call(0);
+      expect(url).toContain("/v1/documents");
+      expect(url).toContain("entity_id=patient-john");
+    });
+  });
+
+  // ── §8.2 remember round-trip ────────────────────────────────────────
+  describe("remember round-trip (§8.2)", () => {
+    it("returns a MemoryItem with id and created_at from the response", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "doc-42",
+          cid: "",
           content_type: "text/plain",
-          created_at: "2026-06-01T00:00:00Z",
-        },
-      ]),
-      "GET /documents/m1/download": binaryResponse("newest"),
-      "GET /documents/m2/download": binaryResponse("older"),
+          size_bytes: 10,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+          created_at: "2026-06-15T12:00:00Z",
+        }),
+      );
+      const mem = newMemory("patient-john");
+      const item = await mem.remember("Anxious about flying");
+      expect(item.id).toBe("doc-42");
+      expect(item.text).toBe("Anxious about flying");
+      expect(item.createdAt).toBe("2026-06-15T12:00:00Z");
+      expect(item.entityId).toBe("patient-john");
+      expect(item.score).toBeUndefined();
     });
-    const items = await makeMemory(t).list();
-    expect(items.map((i) => i.id)).toEqual(["m1", "m2"]);
-    expect(items.map((i) => i.text)).toEqual(["newest", "older"]);
-    expect(items.every((i) => i.score === undefined)).toBe(true);
-  });
-});
 
-// ── forget ───────────────────────────────────────────────────────────
-
-describe("forget", () => {
-  it("issues one DELETE", async () => {
-    const t = new Transport({ "DELETE /documents/doc-x": jsonResponse({}) });
-    await makeMemory(t).forget("doc-x");
-    expect(t.callsTo("DELETE", "/documents/doc-x")).toHaveLength(1);
+    it("rejects empty/whitespace text with a client-side error (no HTTP call)", async () => {
+      const mem = newMemory();
+      await expect(mem.remember("   ")).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
   });
 
-  it("empty id is a client-side error (no HTTP)", async () => {
-    const t = new Transport({});
-    await expect(makeMemory(t).forget("")).rejects.toThrow();
-    expect(t.calls).toHaveLength(0);
+  // ── §8.3 metadata → tags ────────────────────────────────────────────
+  describe("metadata → tags (§8.3)", () => {
+    it("encodes metadata as key:value tags", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "doc-1",
+          cid: "",
+          content_type: "text/plain",
+          size_bytes: 10,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+          created_at: "2026-06-15T00:00:00Z",
+        }),
+      );
+      const mem = newMemory("patient-john");
+      // String-only values (v1). Keys are emitted sorted ascending, so the wire
+      // string is byte-identical across languages regardless of insertion order.
+      await mem.remember("text", { topic: "anxiety", severity: "high" });
+      const { url } = call(0);
+      const decoded = decodeURIComponent(url);
+      expect(decoded).toContain("tags=severity:high,topic:anxiety");
+    });
+
+    it("sorts prefix keys by key, not by assembled tag (a:v,a0:w)", async () => {
+      // Regression: one key is a prefix of another. Sorting the assembled
+      // "key:value" strings would give "a0:w,a:v" ('0' 0x30 < ':' 0x3A);
+      // sorting KEYS (the contract) gives "a:v,a0:w" — matching py/go/.NET.
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "doc-1",
+          cid: "",
+          content_type: "text/plain",
+          size_bytes: 10,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+        }),
+      );
+      const mem = newMemory("patient-john");
+      await mem.remember("text", { a0: "w", a: "v" });
+      const decoded = decodeURIComponent(call(0).url);
+      expect(decoded).toContain("tags=a:v,a0:w");
+    });
+
+    it("rejects a metadata value containing a comma (no HTTP call)", async () => {
+      const mem = newMemory();
+      await expect(
+        mem.remember("text", { note: "a,b" }),
+      ).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects an empty metadata key (no HTTP call)", async () => {
+      const mem = newMemory();
+      await expect(
+        mem.remember("text", { "": "value" }),
+      ).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects a metadata key containing a colon (no HTTP call)", async () => {
+      const mem = newMemory();
+      await expect(
+        mem.remember("text", { "a:b": "value" }),
+      ).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects a metadata key containing a comma (no HTTP call)", async () => {
+      const mem = newMemory();
+      await expect(
+        mem.remember("text", { "a,b": "value" }),
+      ).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
   });
 
-  it("forgetAll deletes every listed doc and returns the count", async () => {
-    const t = new Transport({
-      "GET /documents": [
-        listResp([
-          { doc_id: "a", content_type: "text/plain" },
-          { doc_id: "b", content_type: "text/plain" },
+  // ── §8.4 recall default (recency_weight = 0) ────────────────────────
+  describe("recall default (§8.4)", () => {
+    it("issues exactly one retrieve call, created_at null, server order preserved", async () => {
+      mockFetch.mockResolvedValueOnce(
+        retrieveResponse([
+          { doc_id: "first", distance: 0.10, content: "A" },
+          { doc_id: "second", distance: 0.40, content: "B" },
         ]),
-        listResp([]),
-      ],
-      "DELETE /documents/a": jsonResponse({}),
-      "DELETE /documents/b": jsonResponse({}),
+      );
+      const mem = newMemory("patient-john");
+      const items = await mem.recall("anxiety coping", { k: 5 });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const { url } = call(0);
+      expect(url).toContain("/v1/search?");
+      expect(url).toContain("include_content=true");
+      expect(url).toContain("k=5");
+
+      expect(items.map((i) => i.id)).toEqual(["first", "second"]);
+      expect(items[0].createdAt).toBeUndefined();
+      expect(items[1].createdAt).toBeUndefined();
+      // similarity = 1/(1+distance)
+      expect(items[0].score).toBeCloseTo(1 / 1.1, 10);
+      expect(items[1].score).toBeCloseTo(1 / 1.4, 10);
     });
-    expect(await makeMemory(t).forgetAll()).toBe(2);
-  });
-});
 
-// ── error passthrough ────────────────────────────────────────────────
-
-describe("error passthrough", () => {
-  it("surfaces the typed CreditExhaustedError verbatim", async () => {
-    const t = new Transport({
-      "POST /documents": jsonResponse(
-        { error: "out of credit", code: "credit_exhausted" },
-        402,
-      ),
+    it("forwards since/until to the retrieve call", async () => {
+      mockFetch.mockResolvedValueOnce(retrieveResponse([]));
+      const mem = newMemory("patient-john");
+      await mem.recall("q", {
+        since: "2026-06-01T00:00:00Z",
+        until: "2026-06-10T00:00:00Z",
+      });
+      const { url } = call(0);
+      expect(url).toContain("since=2026-06-01T00%3A00%3A00Z");
+      expect(url).toContain("until=2026-06-10T00%3A00%3A00Z");
     });
-    await expect(makeMemory(t).remember("x")).rejects.toBeInstanceOf(
-      CreditExhaustedError,
-    );
+
+    it("rejects an empty query with a client-side error (no HTTP call)", async () => {
+      const mem = newMemory();
+      await expect(mem.recall("")).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects a whitespace-only query with a client-side error (no HTTP call)", async () => {
+      const mem = newMemory();
+      await expect(mem.recall("   ")).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects k < 1 with a client-side error (no HTTP call)", async () => {
+      const mem = newMemory();
+      await expect(mem.recall("q", { k: 0 })).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── §8.5 recall recency (golden ordering) ───────────────────────────
+  describe("recall recency (§8.5)", () => {
+    it("re-ranks by the §4 blended formula — canonical §8.1 golden vector", async () => {
+      // Shared cross-language golden vector (MEMORY_CONTRACT.md §8.1). These exact
+      // inputs and this exact asserted order must be identical in all four SDKs.
+      const now = () => new Date("2026-06-15T00:00:00Z");
+
+      // retrieve returns candidates in server order (ascending distance).
+      mockFetch.mockResolvedValueOnce(
+        retrieveResponse([
+          { doc_id: "doc-e", distance: 0.05, content: "E" }, // best distance, null ts
+          { doc_id: "doc-a", distance: 0.1, content: "A" }, // 165 days old
+          { doc_id: "doc-b", distance: 0.2, content: "B" }, // 1 day (freshest)
+          { doc_id: "doc-c", distance: 0.3, content: "C" }, // 5 days
+          { doc_id: "doc-d", distance: 0.4, content: "D" }, // 30 days = 1 half-life
+        ]),
+      );
+
+      // get(doc_id) returns each created_at (doc-e: null) — order = first
+      // appearance in candidates (doc-e, doc-a, doc-b, doc-c, doc-d).
+      const records: Record<string, string | undefined> = {
+        "doc-e": undefined,
+        "doc-a": "2026-01-01T00:00:00Z",
+        "doc-b": "2026-06-14T00:00:00Z",
+        "doc-c": "2026-06-10T00:00:00Z",
+        "doc-d": "2026-05-16T00:00:00Z",
+      };
+      for (const id of ["doc-e", "doc-a", "doc-b", "doc-c", "doc-d"]) {
+        mockFetch.mockResolvedValueOnce(
+          jsonResponse({
+            doc_id: id,
+            cid: "",
+            content_type: "text/plain",
+            size_bytes: 1,
+            chunks: 1,
+            vectors: 1,
+            version: 1,
+            created_at: records[id],
+          }),
+        );
+      }
+
+      const mem = newMemory("patient-john", { halfLifeDays: 30, now });
+      const items = await mem.recall("calm", { k: 5, recencyWeight: 0.5 });
+
+      // 1 retrieve + 5 get = 6 calls
+      expect(mockFetch).toHaveBeenCalledTimes(6);
+      // Canonical asserted order.
+      expect(items.map((i) => i.id)).toEqual([
+        "doc-b",
+        "doc-c",
+        "doc-d",
+        "doc-e",
+        "doc-a",
+      ]);
+      // Canonical blended scores (assert within 1e-6 of the §8.1 values).
+      const within1e6 = (actual: number | undefined, expected: number) =>
+        expect(Math.abs((actual as number) - expected)).toBeLessThanOrEqual(1e-6);
+      within1e6(items[0].score, 0.905246); // doc-b
+      within1e6(items[1].score, 0.830065); // doc-c
+      within1e6(items[2].score, 0.607143); // doc-d
+      within1e6(items[3].score, 0.47619); // doc-e (null ts -> recency 0)
+      within1e6(items[4].score, 0.465594); // doc-a (165 days old)
+      // created_at populated in recency mode; null for doc-e.
+      expect(items[0].createdAt).toBe("2026-06-14T00:00:00Z");
+      expect(items[3].createdAt).toBeUndefined();
+    });
+
+    it("returns top-k after the re-rank", async () => {
+      const now = () => new Date("2026-06-15T00:00:00Z");
+      mockFetch.mockResolvedValueOnce(
+        retrieveResponse([
+          { doc_id: "doc-a", distance: 0.1, content: "A" },
+          { doc_id: "doc-b", distance: 0.5, content: "B" },
+          { doc_id: "doc-c", distance: 0.25, content: "C" },
+        ]),
+      );
+      const nowMs = Date.parse("2026-06-15T00:00:00Z");
+      const DAY = 86_400_000;
+      const recs: Record<string, string> = {
+        "doc-a": new Date(nowMs - 90 * DAY).toISOString(),
+        "doc-b": new Date(nowMs).toISOString(),
+        "doc-c": new Date(nowMs - 30 * DAY).toISOString(),
+      };
+      for (const id of ["doc-a", "doc-b", "doc-c"]) {
+        mockFetch.mockResolvedValueOnce(
+          jsonResponse({
+            doc_id: id,
+            cid: "",
+            content_type: "text/plain",
+            size_bytes: 1,
+            chunks: 1,
+            vectors: 1,
+            version: 1,
+            created_at: recs[id],
+          }),
+        );
+      }
+      const mem = newMemory("patient-john", { halfLifeDays: 30, now });
+      const items = await mem.recall("calm", { k: 1, recencyWeight: 0.5 });
+      expect(items).toHaveLength(1);
+      expect(items[0].id).toBe("doc-b");
+    });
+
+    it("clamps recencyWeight above 1 to a pure-recency blend (still N+1)", async () => {
+      const now = () => new Date("2026-06-15T00:00:00Z");
+      mockFetch.mockResolvedValueOnce(
+        retrieveResponse([
+          { doc_id: "doc-old", distance: 0.1, content: "old" },
+          { doc_id: "doc-new", distance: 0.9, content: "new" },
+        ]),
+      );
+      const nowMs = Date.parse("2026-06-15T00:00:00Z");
+      const DAY = 86_400_000;
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "doc-old",
+          cid: "",
+          content_type: "text/plain",
+          size_bytes: 1,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+          created_at: new Date(nowMs - 365 * DAY).toISOString(),
+        }),
+      );
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "doc-new",
+          cid: "",
+          content_type: "text/plain",
+          size_bytes: 1,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+          created_at: new Date(nowMs).toISOString(),
+        }),
+      );
+      const mem = newMemory("patient-john", { halfLifeDays: 30, now });
+      // recencyWeight=5 clamps to 1 -> pure recency -> newest first.
+      const items = await mem.recall("q", { k: 2, recencyWeight: 5 });
+      expect(items.map((i) => i.id)).toEqual(["doc-new", "doc-old"]);
+    });
+  });
+
+  // ── §8.6 list ───────────────────────────────────────────────────────
+  describe("list (§8.6)", () => {
+    it("returns newest-first items with text downloaded per record", async () => {
+      // 1 listing call (server returns created_at-descending) ...
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          documents: [
+            {
+              doc_id: "newest",
+              cid: "",
+              content_type: "text/plain",
+              size_bytes: 5,
+              version: 1,
+              created_at: "2026-06-15T00:00:00Z",
+              entity_id: "patient-john",
+            },
+            {
+              doc_id: "older",
+              cid: "",
+              content_type: "text/plain",
+              size_bytes: 5,
+              version: 1,
+              created_at: "2026-06-01T00:00:00Z",
+              entity_id: "patient-john",
+            },
+          ],
+          count: 2,
+          total: 2,
+          has_more: false,
+        }),
+      );
+      // ... then one download per item.
+      mockFetch.mockResolvedValueOnce(binaryResponse("newest text"));
+      mockFetch.mockResolvedValueOnce(binaryResponse("older text"));
+
+      const mem = newMemory("patient-john");
+      const items = await mem.list({ limit: 50 });
+
+      // 1 + N calls
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      const { url } = call(0);
+      expect(url).toContain("entity_id=patient-john");
+      expect(url).toContain("limit=50");
+
+      expect(items.map((i) => i.id)).toEqual(["newest", "older"]);
+      expect(items[0].text).toBe("newest text");
+      expect(items[1].text).toBe("older text");
+      expect(items[0].createdAt).toBe("2026-06-15T00:00:00Z");
+      expect(items[0].entityId).toBe("patient-john");
+      expect(items[0].score).toBeUndefined();
+    });
+  });
+
+  // ── §8.7 forget / forget_all ────────────────────────────────────────
+  describe("forget / forgetAll (§8.7)", () => {
+    it("forget issues one DELETE", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ status: "tombstoned", doc_id: "doc-1" }),
+      );
+      const mem = newMemory("patient-john");
+      await mem.forget("doc-1");
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const { url, init } = call(0);
+      expect(url).toContain("/v1/documents/doc-1");
+      expect(init.method).toBe("DELETE");
+    });
+
+    it("forget rejects an empty id with a client-side error", async () => {
+      const mem = newMemory();
+      await expect(mem.forget("")).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("forgetAll deletes every listed id and returns the count", async () => {
+      // First page: 2 docs.
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          documents: [
+            { doc_id: "d1", cid: "", content_type: "text/plain", size_bytes: 1, version: 1 },
+            { doc_id: "d2", cid: "", content_type: "text/plain", size_bytes: 1, version: 1 },
+          ],
+          count: 2,
+          total: 2,
+          has_more: false,
+        }),
+      );
+      mockFetch.mockResolvedValueOnce(jsonResponse({ status: "tombstoned", doc_id: "d1" }));
+      mockFetch.mockResolvedValueOnce(jsonResponse({ status: "tombstoned", doc_id: "d2" }));
+      // Second listing (after tombstones): empty -> loop terminates.
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ documents: [], count: 0, total: 0, has_more: false }),
+      );
+
+      const mem = newMemory("patient-john");
+      const count = await mem.forgetAll();
+      expect(count).toBe(2);
+
+      // listing scoped to the entity, with limit=1000
+      const { url } = call(0);
+      expect(url).toContain("entity_id=patient-john");
+      expect(url).toContain("limit=1000");
+
+      // two DELETEs were issued
+      const methods = mockFetch.mock.calls.map((c) => (c[1] as RequestInit)?.method);
+      expect(methods.filter((m) => m === "DELETE")).toHaveLength(2);
+    });
+  });
+
+  // ── §8.8 error passthrough ──────────────────────────────────────────
+  describe("error passthrough (§8.8)", () => {
+    it("surfaces the same typed error the raw client raises (402 credit_exhausted)", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse(
+          { error: "Prepaid credit exhausted", code: "credit_exhausted" },
+          402,
+        ),
+      );
+      const mem = newMemory("patient-john");
+      await expect(mem.remember("text")).rejects.toThrow(CreditExhaustedError);
+    });
+
+    it("surfaces a base AetherApiError for an unrecognized status (recall)", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ error: "boom", code: "embedding_error" }, 500),
+      );
+      const mem = newMemory("patient-john");
+      await expect(mem.recall("q")).rejects.toThrow(AetherApiError);
+    });
+  });
+
+  // ── §8.9 invalid construction ───────────────────────────────────────
+  describe("invalid construction (§8.9)", () => {
+    it("rejects an empty entity_id", () => {
+      expect(() => new Memory("")).toThrow(AetherError);
+    });
+
+    it("rejects a whitespace-only entity_id", () => {
+      expect(() => new Memory("   ")).toThrow(AetherError);
+      expect(() => new Memory("\t\n")).toThrow(AetherError);
+    });
+
+    it("rejects an oversized entity_id (> 256 chars)", () => {
+      expect(() => new Memory("x".repeat(257))).toThrow(AetherError);
+    });
+
+    it("accepts a 256-char entity_id (boundary)", () => {
+      expect(() => new Memory("x".repeat(256))).not.toThrow();
+    });
+  });
+
+  // ── extract_facts reserved no-op ────────────────────────────────────
+  describe("extractFacts reserved no-op", () => {
+    it("stores a single memory regardless of the flag (one HTTP call)", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "doc-1",
+          cid: "",
+          content_type: "text/plain",
+          size_bytes: 10,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+          created_at: "2026-06-15T00:00:00Z",
+        }),
+      );
+      const mem = newMemory("patient-john", { extractFacts: true });
+      const item = await mem.remember("fact one. fact two. fact three.");
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(item.text).toBe("fact one. fact two. fact three.");
+    });
+  });
+
+  // ── Partition composition ──────────────────────────────────
+  // Memory delegates to the raw client, so building a Memory on a partition
+  // handle scopes every operation to BOTH partition and entity — without any
+  // change to the Memory constructor or its public surface.
+  describe("partition composition", () => {
+    it("remember on a partition-scoped client sends both partition and entity_id", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "doc-1",
+          cid: "",
+          content_type: "text/plain",
+          size_bytes: 10,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+          created_at: "2026-06-15T00:00:00Z",
+        }),
+      );
+      const client = new AetherClient({
+        baseUrl: "http://localhost:9000",
+        apiKey: "aether_testkey123",
+        maxRetries: 0,
+      });
+      const mem = new Memory("patient-john", { client: client.partition("tenant-x") });
+      await mem.remember("hello");
+      const { url } = call(0);
+      expect(url).toContain("partition=tenant-x");
+      expect(url).toContain("entity_id=patient-john");
+    });
+
+    it("recall on a partition-scoped client sends both partition and entity_id", async () => {
+      mockFetch.mockResolvedValueOnce(
+        retrieveResponse([{ doc_id: "d", distance: 0.2, content: "x" }]),
+      );
+      const client = new AetherClient({
+        baseUrl: "http://localhost:9000",
+        apiKey: "aether_testkey123",
+        maxRetries: 0,
+      });
+      const mem = new Memory("patient-john", { client: client.partition("tenant-x") });
+      await mem.recall("anxiety");
+      const { url } = call(0);
+      expect(url).toContain("/v1/search?");
+      expect(url).toContain("partition=tenant-x");
+      expect(url).toContain("entity_id=patient-john");
+    });
   });
 });
 
-// ── invalid construction ─────────────────────────────────────────────
+// ── Part II — memory graph (MEMORY_CONTRACT.md §14) ────
 
-describe("invalid construction", () => {
-  it.each(["", "   ", "\t"])("rejects empty/whitespace entityId %j", (id) => {
-    expect(() => new Memory(id, { client: {} as AetherClient })).toThrow();
+function entityWire(over: Record<string, unknown> = {}) {
+  return {
+    memory_entity_id: "ent-1",
+    entity_id: "patient-john",
+    partition: null,
+    entity_type: "person",
+    display_name: "John",
+    aliases: [],
+    attributes: {},
+    created_at: "2026-06-15T00:00:00Z",
+    updated_at: "2026-06-15T00:00:00Z",
+    ...over,
+  };
+}
+function relationshipWire(over: Record<string, unknown> = {}) {
+  return {
+    relationship_id: "rel-1",
+    entity_id: "patient-john",
+    partition: null,
+    from_entity_id: "ent-1",
+    to_entity_id: "ent-2",
+    relationship_type: "works_at",
+    attributes: {},
+    valid_from: null,
+    observed_at: "2026-06-15T00:00:00Z",
+    invalid_from: null,
+    created_at: "2026-06-15T00:00:00Z",
+    updated_at: "2026-06-15T00:00:00Z",
+    ...over,
+  };
+}
+function factWire(over: Record<string, unknown> = {}) {
+  return {
+    fact_id: "fact-1",
+    entity_id: "patient-john",
+    partition: null,
+    subject_type: "owner",
+    subject_id: null,
+    predicate: "favorite_color",
+    value: "blue",
+    cardinality: "single",
+    valid_from: null,
+    observed_at: "2026-06-15T00:00:00Z",
+    invalid_from: null,
+    supersedes_fact_id: null,
+    created_at: "2026-06-15T00:00:00Z",
+    updated_at: "2026-06-15T00:00:00Z",
+    ...over,
+  };
+}
+function bodyOf(n: number): Record<string, unknown> {
+  const { init } = call(n);
+  return JSON.parse(init.body as string);
+}
+
+describe("Memory graph (Part II)", () => {
+  describe("entities", () => {
+    it("upsertEntity round-trips (POST, entity_id param, parsed result)", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse(entityWire({ memory_entity_id: "ent-9" }), 201),
+      );
+      const mem = newMemory("patient-john");
+      const ent = await mem.upsertEntity("person", {
+        displayName: "John",
+        attributes: { age: 30, vip: true },
+      });
+      const { url, init } = call(0);
+      expect(init.method).toBe("POST");
+      expect(url).toContain("/v1/memory/entities");
+      expect(url).toContain("entity_id=patient-john");
+      const body = bodyOf(0);
+      expect(body.entity_type).toBe("person");
+      expect(body.display_name).toBe("John");
+      expect(body.attributes).toEqual({ age: 30, vip: true });
+      expect(body.memory_entity_id).toBeUndefined();
+      expect(ent.memoryEntityId).toBe("ent-9");
+      expect(ent.entityId).toBe("patient-john");
+    });
+
+    it("upsertEntity sends a supplied id", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(entityWire(), 201));
+      const mem = newMemory("patient-john");
+      await mem.upsertEntity("person", { memoryEntityId: "ent-fixed" });
+      expect(bodyOf(0).memory_entity_id).toBe("ent-fixed");
+    });
+
+    it("getEntity fetches by id", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(entityWire()));
+      const mem = newMemory("patient-john");
+      const ent = await mem.getEntity("ent-1");
+      const { url, init } = call(0);
+      expect(init.method).toBe("GET");
+      expect(url).toContain("/v1/memory/entities/ent-1");
+      expect(url).toContain("entity_id=patient-john");
+      expect(ent.memoryEntityId).toBe("ent-1");
+    });
+
+    it("listEntities sends provided filters and omits unset", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ entities: [entityWire(), entityWire({ memory_entity_id: "ent-2" })], count: 2 }),
+      );
+      const mem = newMemory("patient-john");
+      const ents = await mem.listEntities({ entityType: "person", limit: 10 });
+      const { url } = call(0);
+      expect(url).toContain("entity_type=person");
+      expect(url).toContain("limit=10");
+      expect(ents).toHaveLength(2);
+    });
   });
 
-  it("rejects an oversized entityId", () => {
-    expect(
-      () => new Memory("x".repeat(257), { client: {} as AetherClient }),
-    ).toThrow();
+  describe("scoping + partition", () => {
+    it("graph call carries entity_id and partition", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(entityWire(), 201));
+      const client = new AetherClient({
+        baseUrl: "http://localhost:9000",
+        apiKey: "k",
+        maxRetries: 0,
+      });
+      const mem = new Memory("patient-john", { client: client.partition("tenant-x") });
+      await mem.upsertEntity("person");
+      const { url } = call(0);
+      expect(url).toContain("entity_id=patient-john");
+      expect(url).toContain("partition=tenant-x");
+    });
+
+    it("unscoped graph call omits partition", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(entityWire(), 201));
+      const mem = newMemory("patient-john");
+      await mem.upsertEntity("person");
+      expect(call(0).url).not.toContain("partition=");
+    });
   });
 
-  it("accepts a max-length entityId", () => {
-    expect(
-      () => new Memory("x".repeat(256), { client: {} as AetherClient }),
-    ).not.toThrow();
+  describe("relationships", () => {
+    it("relate posts from/to/type + valid_from", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse(relationshipWire({ relationship_id: "rel-9" }), 201),
+      );
+      const mem = newMemory("patient-john");
+      const rel = await mem.relate("ent-1", "ent-2", "works_at", {
+        validFrom: "2026-01-01T00:00:00Z",
+      });
+      const body = bodyOf(0);
+      expect(body.from_entity_id).toBe("ent-1");
+      expect(body.to_entity_id).toBe("ent-2");
+      expect(body.relationship_type).toBe("works_at");
+      expect(body.valid_from).toBe("2026-01-01T00:00:00Z");
+      expect(rel.relationshipId).toBe("rel-9");
+      expect(rel.fromEntityId).toBe("ent-1");
+    });
+
+    it("listRelationships sends include_inactive and as_of when set", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ relationships: [relationshipWire()], count: 1 }),
+      );
+      const mem = newMemory("patient-john");
+      await mem.listRelationships({
+        includeInactive: true,
+        asOf: "2026-06-01T00:00:00Z",
+        fromEntityId: "ent-1",
+      });
+      const { url } = call(0);
+      expect(url).toContain("include_inactive=true");
+      expect(url).toContain("as_of=2026-06-01");
+      expect(url).toContain("from_entity_id=ent-1");
+    });
+
+    it("listRelationships default omits include_inactive", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ relationships: [], count: 0 }));
+      const mem = newMemory("patient-john");
+      await mem.listRelationships();
+      expect(call(0).url).not.toContain("include_inactive");
+    });
   });
 
-  it("rejects a non-positive halfLifeDays", () => {
-    expect(
-      () =>
-        new Memory("u", { client: {} as AetherClient, halfLifeDays: 0 }),
-    ).toThrow();
+  describe("facts", () => {
+    it("rememberFact defaults to owner subject", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(factWire(), 201));
+      const mem = newMemory("patient-john");
+      const fact = await mem.rememberFact("favorite_color", "blue");
+      const body = bodyOf(0);
+      expect(body.subject_type).toBe("owner");
+      expect(body.subject_id).toBeUndefined();
+      expect(body.predicate).toBe("favorite_color");
+      expect(body.value).toBe("blue");
+      expect(fact.factId).toBe("fact-1");
+    });
+
+    it("rememberFact with entity subject sends subject_id", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse(factWire({ subject_type: "entity", subject_id: "ent-1" }), 201),
+      );
+      const mem = newMemory("patient-john");
+      await mem.rememberFact("role", "engineer", {
+        subjectType: "entity",
+        subjectId: "ent-1",
+      });
+      const body = bodyOf(0);
+      expect(body.subject_type).toBe("entity");
+      expect(body.subject_id).toBe("ent-1");
+    });
+
+    it("rememberFact sends scalar value types including null", async () => {
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse(factWire({ value: 7 }), 201))
+        .mockResolvedValueOnce(jsonResponse(factWire({ value: null }), 201));
+      const mem = newMemory("patient-john");
+      await mem.rememberFact("count", 7);
+      expect(bodyOf(0).value).toBe(7);
+      await mem.rememberFact("nickname", null);
+      expect(bodyOf(1).value).toBeNull();
+    });
+
+    it("entity subject without subjectId throws before any HTTP", async () => {
+      const mem = newMemory("patient-john");
+      await expect(
+        mem.rememberFact("role", "x", { subjectType: "entity" }),
+      ).rejects.toBeInstanceOf(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("listFacts sends subject + predicate filters", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ facts: [factWire()], count: 1 }));
+      const mem = newMemory("patient-john");
+      await mem.listFacts({
+        subjectType: "entity",
+        subjectId: "ent-1",
+        predicate: "role",
+        includeInactive: true,
+      });
+      const { url } = call(0);
+      expect(url).toContain("subject_type=entity");
+      expect(url).toContain("subject_id=ent-1");
+      expect(url).toContain("predicate=role");
+      expect(url).toContain("include_inactive=true");
+      expect(url).not.toContain("history=");
+    });
+
+    it("factHistory sends history=true with subject + predicate", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          facts: [factWire({ invalid_from: "2026-06-10T00:00:00Z" }), factWire({ fact_id: "fact-2" })],
+          count: 2,
+        }),
+      );
+      const mem = newMemory("patient-john");
+      const facts = await mem.factHistory("favorite_color", {
+        subjectType: "entity",
+        subjectId: "ent-1",
+      });
+      const { url } = call(0);
+      expect(url).toContain("history=true");
+      expect(url).toContain("subject_type=entity");
+      expect(url).toContain("subject_id=ent-1");
+      expect(url).toContain("predicate=favorite_color");
+      expect(facts).toHaveLength(2);
+    });
   });
-});
 
-// ── type sanity ──────────────────────────────────────────────────────
+  describe("consolidate", () => {
+    it("posts and parses the report", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ active_facts_before: 5, active_facts_after: 3, retracted: 2 }),
+      );
+      const mem = newMemory("patient-john");
+      const report = await mem.consolidate();
+      const { url, init } = call(0);
+      expect(init.method).toBe("POST");
+      expect(url).toContain("/v1/memory/consolidate");
+      expect(url).toContain("entity_id=patient-john");
+      expect(report.activeFactsBefore).toBe(5);
+      expect(report.activeFactsAfter).toBe(3);
+      expect(report.retracted).toBe(2);
+    });
+  });
 
-describe("MemoryItem typing", () => {
-  it("exposes the documented fields", () => {
-    const item: MemoryItem = {
-      id: "d",
-      text: "t",
-      createdAt: "2026-06-15T00:00:00Z",
-      entityId: "user-42",
-      score: 0.9,
-    };
-    expect(item.id).toBe("d");
+  describe("validation (no HTTP)", () => {
+    it("empty entityType throws", async () => {
+      const mem = newMemory("patient-john");
+      await expect(mem.upsertEntity("  ")).rejects.toBeInstanceOf(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+    it("empty predicate throws", async () => {
+      const mem = newMemory("patient-john");
+      await expect(mem.rememberFact("", "x")).rejects.toBeInstanceOf(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+    it("bad subjectType throws", async () => {
+      const mem = newMemory("patient-john");
+      await expect(
+        // @ts-expect-error deliberately invalid subjectType
+        mem.rememberFact("p", "x", { subjectType: "bogus" }),
+      ).rejects.toBeInstanceOf(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+    it("empty relate args throw", async () => {
+      const mem = newMemory("patient-john");
+      await expect(mem.relate("", "ent-2", "works_at")).rejects.toBeInstanceOf(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+    it("empty getEntity id throws", async () => {
+      const mem = newMemory("patient-john");
+      await expect(mem.getEntity("")).rejects.toBeInstanceOf(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("error passthrough", () => {
+    it("402 surfaces the typed raw-client error", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ error: "credits exhausted", code: "credit_exhausted" }, 402),
+      );
+      const mem = newMemory("patient-john");
+      await expect(mem.upsertEntity("person")).rejects.toBeInstanceOf(
+        CreditExhaustedError,
+      );
+    });
   });
 });

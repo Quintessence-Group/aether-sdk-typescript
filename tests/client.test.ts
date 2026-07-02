@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AetherClient } from "../src/client.js";
-import { AetherApiError, AetherNetworkError } from "../src/errors.js";
+import {
+  AetherApiError,
+  AetherError,
+  AetherNetworkError,
+  CreditExhaustedError,
+  TenantPausedError,
+} from "../src/errors.js";
 
 const mockFetch = vi.fn();
 
@@ -86,6 +92,70 @@ describe("AetherClient", () => {
       mockFetch.mockRejectedValueOnce(new TypeError("fetch failed"));
       await expect(client.status()).rejects.toThrow(AetherNetworkError);
     });
+
+    it("throws CreditExhaustedError on a 402 credit_exhausted insert", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: "Prepaid credit balance exhausted; top up to continue.",
+            code: "credit_exhausted",
+          },
+          402,
+        ),
+      );
+
+      await expect(client.insertText("some text content")).rejects.toThrow(
+        CreditExhaustedError,
+      );
+    });
+
+    it("populates the typed error fields from a 402 credit_exhausted body", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: "Prepaid credit balance exhausted; top up to continue.",
+            code: "credit_exhausted",
+          },
+          402,
+        ),
+      );
+
+      try {
+        await client.insertText("some text content");
+        throw new Error("expected insertText to reject");
+      } catch (e) {
+        expect(e).toBeInstanceOf(CreditExhaustedError);
+        expect(e).toBeInstanceOf(AetherApiError);
+        const err = e as CreditExhaustedError;
+        expect(err.status).toBe(402);
+        expect(err.errorCode).toBe("credit_exhausted");
+        expect(err.body.code).toBe("credit_exhausted");
+      }
+    });
+
+    it("throws TenantPausedError on a 403 tenant_paused search", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: "Tenant has been paused by the operator",
+            code: "tenant_paused",
+          },
+          403,
+        ),
+      );
+
+      try {
+        await client.search("machine learning", 5);
+        throw new Error("expected search to reject");
+      } catch (e) {
+        expect(e).toBeInstanceOf(TenantPausedError);
+        expect(e).toBeInstanceOf(AetherApiError);
+        const err = e as TenantPausedError;
+        expect(err.status).toBe(403);
+        expect(err.errorCode).toBe("tenant_paused");
+        expect(err.body.error).toBe("Tenant has been paused by the operator");
+      }
+    });
   });
 
   // ── Documents ───────────────────────────────────────────────────
@@ -109,11 +179,160 @@ describe("AetherClient", () => {
       });
 
       const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents?");
+      expect(url).toContain("/v1/documents?");
       expect(url).toContain("filename=test.txt");
       expect(url).toContain("content_type=text%2Fplain");
       expect(result.doc_id).toBe("abc-123");
       expect(result.chunks).toBe(3);
+    });
+
+    it("sends entity_id as URL param when entityId is provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "blake3hash",
+          chunks: 3,
+          vectors: 3,
+          version: 1,
+          entity_id: "customer-42",
+        }),
+      );
+
+      const data = new TextEncoder().encode("hello world");
+      const result = await client.insert(data, {
+        filename: "test.txt",
+        entityId: "customer-42",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer-42");
+      expect(result.entity_id).toBe("customer-42");
+    });
+
+    it("omits entity_id when entityId is not provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "blake3hash",
+          chunks: 3,
+          vectors: 3,
+          version: 1,
+        }),
+      );
+
+      await client.insert(new TextEncoder().encode("hello"), { filename: "test.txt" });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).not.toContain("entity_id");
+    });
+
+    it("sends source as URL param when source is provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "blake3hash",
+          chunks: 3,
+          vectors: 3,
+          version: 1,
+          source: "slack",
+        }),
+      );
+
+      const data = new TextEncoder().encode("hello world");
+      const result = await client.insert(data, {
+        filename: "test.txt",
+        source: "slack",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("source=slack");
+      expect(result.source).toBe("slack");
+    });
+
+    it("omits source when source is not provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "blake3hash",
+          chunks: 3,
+          vectors: 3,
+          version: 1,
+        }),
+      );
+
+      await client.insert(new TextEncoder().encode("hello"), { filename: "test.txt" });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).not.toContain("source=");
+    });
+
+    it("echoes tags/source as defaults when the server omits them", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "blake3hash",
+          chunks: 3,
+          vectors: 3,
+          version: 1,
+        }),
+      );
+
+      const result = await client.insert(new TextEncoder().encode("hi"), {
+        filename: "test.txt",
+      });
+
+      // Tolerant parsing: older payloads with no tags/source default cleanly.
+      expect(result.tags).toEqual([]);
+      expect(result.source).toBeNull();
+    });
+
+    it("round-trips tags/source/created_at from the insert response", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "blake3hash",
+          chunks: 3,
+          vectors: 3,
+          version: 1,
+          tags: ["animal", "mammal"],
+          source: "notion",
+          created_at: "2026-06-15T09:30:00Z",
+        }),
+      );
+
+      const result = await client.insert(new TextEncoder().encode("hi"), {
+        filename: "test.txt",
+      });
+
+      expect(result.tags).toEqual(["animal", "mammal"]);
+      expect(result.source).toBe("notion");
+      expect(result.created_at).toBe("2026-06-15T09:30:00Z");
+    });
+
+    it("parses size_bytes, title, and content_type from the insert response", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "blake3hash",
+          title: "test.txt",
+          content_type: "text/plain",
+          size_bytes: 11,
+          chunks: 3,
+          vectors: 3,
+          version: 1,
+        }),
+      );
+
+      const data = new TextEncoder().encode("hello world");
+      const result = await client.insert(data, {
+        filename: "test.txt",
+        contentType: "text/plain",
+      });
+
+      // size_bytes / title / content_type must survive the round-trip, mirroring get()/list().
+      expect(result.size_bytes).toBe(11);
+      expect(result.title).toBe("test.txt");
+      expect(result.content_type).toBe("text/plain");
     });
   });
 
@@ -142,7 +361,7 @@ describe("AetherClient", () => {
       });
 
       const [url, init] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents?");
+      expect(url).toContain("/v1/documents?");
       expect(url).toContain("filename=upload.pdf");
       expect(url).toContain("content_type=application%2Fpdf");
       expect(init.method).toBe("POST");
@@ -173,6 +392,54 @@ describe("AetherClient", () => {
       const [url] = mockFetch.mock.calls[0];
       expect(url).toContain("filename=upload.bin");
       expect(url).toContain("content_type=application%2Foctet-stream");
+    });
+
+    it("sends entity_id as URL param when entityId is provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "stream-456",
+          cid: "hash",
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+        }),
+      );
+
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data"));
+          controller.close();
+        },
+      });
+
+      await client.insertStream(stream, { entityId: "customer-42" });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer-42");
+    });
+
+    it("sends source as URL param when source is provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "stream-789",
+          cid: "hash",
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+        }),
+      );
+
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data"));
+          controller.close();
+        },
+      });
+
+      await client.insertStream(stream, { source: "slack" });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("source=slack");
     });
 
     it("does not retry on 503", async () => {
@@ -212,6 +479,59 @@ describe("AetherClient", () => {
       expect(init.method).toBe("POST");
       expect(result.doc_id).toBe("txt-456");
     });
+
+    it("parses size_bytes from the insertText response", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "txt-456",
+          cid: "hash",
+          title: "text.txt",
+          content_type: "text/plain",
+          size_bytes: 17,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+        }),
+      );
+
+      const result = await client.insertText("some text content");
+      expect(result.size_bytes).toBe(17);
+      expect(result.content_type).toBe("text/plain");
+    });
+
+    it("sends entity_id as URL param when entityId is provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "txt-789",
+          cid: "hash",
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+        }),
+      );
+
+      await client.insertText("some text content", { entityId: "customer-42" });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer-42");
+    });
+
+    it("sends source as URL param when source is provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "txt-790",
+          cid: "hash",
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+        }),
+      );
+
+      await client.insertText("some text content", { source: "slack" });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("source=slack");
+    });
   });
 
   describe("update", () => {
@@ -232,9 +552,51 @@ describe("AetherClient", () => {
       });
 
       const [url, init] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents/abc-123?");
+      expect(url).toContain("/v1/documents/abc-123?");
       expect(init.method).toBe("PUT");
       expect(result.version).toBe(2);
+    });
+
+    it("sends entity_id as URL param when entityId is provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "newhash",
+          chunks: 4,
+          vectors: 4,
+          version: 2,
+        }),
+      );
+
+      const data = new TextEncoder().encode("updated content");
+      await client.update("abc-123", data, {
+        filename: "test.txt",
+        entityId: "customer-42",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer-42");
+    });
+
+    it("sends source as URL param when source is provided", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "newhash",
+          chunks: 4,
+          vectors: 4,
+          version: 2,
+        }),
+      );
+
+      const data = new TextEncoder().encode("updated content");
+      await client.update("abc-123", data, {
+        filename: "test.txt",
+        source: "notion",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("source=notion");
     });
   });
 
@@ -256,9 +618,47 @@ describe("AetherClient", () => {
 
       const doc = await client.get("abc-123");
       const [url] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://localhost:9000/documents/abc-123");
+      expect(url).toBe("http://localhost:9000/v1/documents/abc-123");
       expect(doc.title).toBe("Test Doc");
       expect(doc.size_bytes).toBe(1024);
+    });
+
+    it("round-trips tags and source on read", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "hash",
+          content_type: "text/plain",
+          size_bytes: 10,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+          tags: ["animal", "mammal"],
+          source: "slack",
+        }),
+      );
+
+      const doc = await client.get("abc-123");
+      expect(doc.tags).toEqual(["animal", "mammal"]);
+      expect(doc.source).toBe("slack");
+    });
+
+    it("defaults tags to [] and source to null when omitted", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          cid: "hash",
+          content_type: "text/plain",
+          size_bytes: 10,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+        }),
+      );
+
+      const doc = await client.get("abc-123");
+      expect(doc.tags).toEqual([]);
+      expect(doc.source).toBeNull();
     });
   });
 
@@ -306,6 +706,105 @@ describe("AetherClient", () => {
       expect(result.total).toBe(2);
       expect(result.has_more).toBe(false);
     });
+
+    it("passes entity and time window filters as URL params", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ documents: [], count: 0, total: 0, has_more: false }),
+      );
+
+      await client.list({
+        entityId: "customer-42",
+        since: "2026-06-01T00:00:00Z",
+        until: "2026-06-10T23:59:59Z",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer-42");
+      expect(url).toContain("since=2026-06-01T00%3A00%3A00Z");
+      expect(url).toContain("until=2026-06-10T23%3A59%3A59Z");
+    });
+
+    it("passes last_n_days as URL param", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ documents: [], count: 0, total: 0, has_more: false }),
+      );
+
+      await client.list({ entityId: "customer-42", lastNDays: 30 });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer-42");
+      expect(url).toContain("last_n_days=30");
+    });
+
+    it("passes metadata facet filters as CSV URL params", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ documents: [], count: 0, total: 0, has_more: false }),
+      );
+
+      await client.list({
+        tags: ["animal", "mammal"],
+        anyTags: ["dog", "cat"],
+        contentTypes: ["text/plain", "text/markdown"],
+        sources: ["slack", "notion"],
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("tags=animal%2Cmammal");
+      expect(url).toContain("any_tags=dog%2Ccat");
+      expect(url).toContain("content_type=text%2Fplain%2Ctext%2Fmarkdown");
+      expect(url).toContain("source=slack%2Cnotion");
+    });
+
+    it("omits filter params when no filters are set", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ documents: [], count: 0, total: 0, has_more: false }),
+      );
+
+      await client.list({ offset: 5, limit: 10 });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).not.toContain("entity_id");
+      expect(url).not.toContain("since");
+      expect(url).not.toContain("until");
+      expect(url).not.toContain("last_n_days");
+      expect(url).not.toContain("any_tags");
+      expect(url).not.toContain("content_type");
+      expect(url).not.toContain("source");
+    });
+
+    it("normalizes tags/source on listed documents", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          documents: [
+            {
+              doc_id: "a",
+              cid: "",
+              content_type: "text/plain",
+              size_bytes: 100,
+              version: 1,
+              tags: ["x"],
+              source: "slack",
+            },
+            {
+              doc_id: "b",
+              cid: "",
+              content_type: "application/pdf",
+              size_bytes: 200,
+              version: 2,
+            },
+          ],
+          count: 2,
+          total: 2,
+          has_more: false,
+        }),
+      );
+
+      const result = await client.list();
+      expect(result.documents[0].tags).toEqual(["x"]);
+      expect(result.documents[0].source).toBe("slack");
+      expect(result.documents[1].tags).toEqual([]);
+      expect(result.documents[1].source).toBeNull();
+    });
   });
 
   describe("delete", () => {
@@ -316,7 +815,19 @@ describe("AetherClient", () => {
 
       await client.delete("abc-123");
       const [url, init] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents/abc-123");
+      expect(url).toContain("/v1/documents/abc-123");
+      expect(url).not.toContain("hard");
+      expect(init.method).toBe("DELETE");
+    });
+
+    it("hard delete sends ?hard=true", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ status: "hard_deleted", doc_id: "abc-123" }),
+      );
+
+      await client.delete("abc-123", { hard: true });
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v1/documents/abc-123?hard=true");
       expect(init.method).toBe("DELETE");
     });
   });
@@ -329,7 +840,7 @@ describe("AetherClient", () => {
 
       await client.restore("abc-123");
       const [url, init] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents/abc-123/restore");
+      expect(url).toContain("/v1/documents/abc-123/restore");
       expect(init.method).toBe("POST");
     });
   });
@@ -344,7 +855,7 @@ describe("AetherClient", () => {
           results: [
             {
               doc_id: "abc",
-              score: 92.5,
+              distance: 0.15,
               title: "ML Intro",
               content_type: "text/plain",
             },
@@ -357,7 +868,7 @@ describe("AetherClient", () => {
       expect(url).toContain("q=machine+learning");
       expect(url).toContain("k=5");
       expect(results).toHaveLength(1);
-      expect(results[0].score).toBe(92.5);
+      expect(results[0].distance).toBe(0.15);
     });
 
     it("defaults k to 10", async () => {
@@ -368,6 +879,209 @@ describe("AetherClient", () => {
       await client.search("test");
       const [url] = mockFetch.mock.calls[0];
       expect(url).toContain("k=10");
+    });
+
+    it("passes entity and time window filters as URL params", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "test", results: [] }),
+      );
+
+      await client.search("test", 5, {
+        entityId: "customer:42",
+        since: "2026-06-01T00:00:00Z",
+        until: "2026-06-10T23:59:59Z",
+        maxDistance: 0.4,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer%3A42");
+      expect(url).toContain("since=2026-06-01T00%3A00%3A00Z");
+      expect(url).toContain("until=2026-06-10T23%3A59%3A59Z");
+      expect(url).toContain("max_distance=0.4");
+    });
+
+    it("passes last_n_days as URL param", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "test", results: [] }),
+      );
+
+      await client.search("test", 5, { entityId: "customer-42", lastNDays: 30 });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer-42");
+      expect(url).toContain("last_n_days=30");
+    });
+
+    it("omits filter params when no options are set", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "test", results: [] }),
+      );
+
+      await client.search("test");
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).not.toContain("entity_id");
+      expect(url).not.toContain("since");
+      expect(url).not.toContain("until");
+      expect(url).not.toContain("last_n_days");
+      expect(url).not.toContain("max_distance");
+      expect(url).not.toContain("any_tags");
+      expect(url).not.toContain("content_type");
+      expect(url).not.toContain("source");
+    });
+
+    it("passes the metadata facet filters as CSV URL params", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "test", results: [] }),
+      );
+
+      await client.search("test", 5, {
+        tags: ["animal"],
+        anyTags: ["dog", "cat"],
+        contentTypes: ["text/plain", "text/markdown"],
+        sources: ["slack", "notion"],
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("tags=animal");
+      expect(url).toContain("any_tags=dog%2Ccat");
+      expect(url).toContain("content_type=text%2Fplain%2Ctext%2Fmarkdown");
+      expect(url).toContain("source=slack%2Cnotion");
+    });
+
+    it("echoes tags/source/created_at on hits and defaults them when omitted", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "test",
+          results: [
+            {
+              doc_id: "a",
+              distance: 0.1,
+              content_type: "text/plain",
+              tags: ["animal", "mammal"],
+              source: "slack",
+              created_at: "2026-06-15T09:30:00Z",
+            },
+            {
+              doc_id: "b",
+              distance: 0.2,
+              content_type: "text/plain",
+            },
+          ],
+        }),
+      );
+
+      const results = await client.search("test", 5);
+      expect(results[0].tags).toEqual(["animal", "mammal"]);
+      expect(results[0].source).toBe("slack");
+      expect(results[0].created_at).toBe("2026-06-15T09:30:00Z");
+      // Tolerant parsing: older hits with no tags/source default cleanly.
+      expect(results[1].tags).toEqual([]);
+      expect(results[1].source).toBeNull();
+      expect(results[1].created_at).toBeUndefined();
+    });
+
+    it("derives distance from a score-only engine payload and reads created_at/updated_at", async () => {
+      // The deployed engine serves `score` (0-100), not a raw `distance`.
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "test",
+          results: [
+            {
+              doc_id: "a",
+              score: 90,
+              content_type: "text/plain",
+              created_at: "2026-06-15T09:30:00Z",
+              updated_at: "2026-06-20T11:00:00Z",
+            },
+            {
+              doc_id: "b",
+              score: 0,
+              content_type: "text/plain",
+            },
+          ],
+        }),
+      );
+
+      const results = await client.search("test", 5);
+      // distance = clamp(1 - score/100, 0, 1)
+      expect(results[0].distance).toBeCloseTo(0.1, 10);
+      expect(results[1].distance).toBe(1);
+      expect(results[0].created_at).toBe("2026-06-15T09:30:00Z");
+      expect(results[0].updated_at).toBe("2026-06-20T11:00:00Z");
+      // updated_at defaults to null when the server omits it (never updated).
+      expect(results[1].updated_at).toBeNull();
+    });
+
+    it("still parses a legacy distance payload (no score) unchanged", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "test",
+          results: [
+            {
+              doc_id: "a",
+              distance: 0.15,
+              content_type: "text/plain",
+            },
+          ],
+        }),
+      );
+
+      const results = await client.search("test", 5);
+      // Explicit distance wins over any derivation.
+      expect(results[0].distance).toBe(0.15);
+      expect(results[0].updated_at).toBeNull();
+    });
+
+    it("passes recency_weight and half_life_days as URL params", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "test", results: [] }),
+      );
+
+      await client.search("test", 5, {
+        recencyWeight: 0.3,
+        halfLifeDays: 14,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("recency_weight=0.3");
+      expect(url).toContain("half_life_days=14");
+    });
+
+    it("omits recency params when not set", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "test", results: [] }),
+      );
+
+      await client.search("test", 5);
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).not.toContain("recency_weight");
+      expect(url).not.toContain("half_life_days");
+    });
+
+    it("passes freshness_weight and freshness_half_life_days as URL params", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "test", results: [] }),
+      );
+
+      await client.search("test", 5, {
+        freshnessWeight: 0.4,
+        freshnessHalfLifeDays: 7,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("freshness_weight=0.4");
+      expect(url).toContain("freshness_half_life_days=7");
+    });
+
+    it("omits freshness params when not set", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "test", results: [] }),
+      );
+
+      await client.search("test", 5);
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).not.toContain("freshness_weight");
+      expect(url).not.toContain("freshness_half_life_days");
     });
   });
 
@@ -407,7 +1121,7 @@ describe("AetherClient", () => {
       const result = await client.downloadText("abc-123");
       expect(result).toBe(text);
       const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents/abc-123/download");
+      expect(url).toContain("/v1/documents/abc-123/download");
     });
   });
 
@@ -418,8 +1132,8 @@ describe("AetherClient", () => {
         jsonResponse({
           query: "test query",
           results: [
-            { doc_id: "doc-1", score: 95, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-2", score: 80, title: "Doc 2", content_type: "text/plain" },
+            { doc_id: "doc-1", distance: 0.1, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-2", distance: 0.3, title: "Doc 2", content_type: "text/plain" },
           ],
         }),
       );
@@ -435,7 +1149,7 @@ describe("AetherClient", () => {
       expect(results).toHaveLength(2);
       expect(results[0].doc_id).toBe("doc-1");
       expect(results[0].content).toBe("Content of doc 1");
-      expect(results[0].score).toBe(95);
+      expect(results[0].distance).toBe(0.1);
       expect(results[1].content).toBe("Content of doc 2");
     });
 
@@ -444,9 +1158,9 @@ describe("AetherClient", () => {
         jsonResponse({
           query: "test",
           results: [
-            { doc_id: "doc-1", score: 95, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-1", score: 88, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-2", score: 70, title: "Doc 2", content_type: "text/plain" },
+            { doc_id: "doc-1", distance: 0.1, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-1", distance: 0.2, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-2", distance: 0.3, title: "Doc 2", content_type: "text/plain" },
           ],
         }),
       );
@@ -460,8 +1174,124 @@ describe("AetherClient", () => {
       const results = await client.retrieve("test", 5);
       // Should only have 2 results despite 3 search hits
       expect(results).toHaveLength(2);
-      // Should keep the best (first) match (score 95, not 88)
-      expect(results[0].score).toBe(95);
+      // Should keep the closest match (distance 0.1, not 0.2)
+      expect(results[0].distance).toBe(0.1);
+    });
+
+    it("forwards entity and time window filters to search", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "test",
+          results: [
+            {
+              doc_id: "doc-1",
+              distance: 0.1,
+              content_type: "text/plain",
+              content: "Inline content",
+            },
+          ],
+        }),
+      );
+
+      await client.retrieve("test", 5, {
+        entityId: "customer-42",
+        since: "2026-06-01T00:00:00Z",
+        until: "2026-06-10T23:59:59Z",
+        lastNDays: 30,
+        maxDistance: 0.4,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v1/search?");
+      expect(url).toContain("entity_id=customer-42");
+      expect(url).toContain("since=2026-06-01T00%3A00%3A00Z");
+      expect(url).toContain("until=2026-06-10T23%3A59%3A59Z");
+      expect(url).toContain("last_n_days=30");
+      expect(url).toContain("max_distance=0.4");
+    });
+
+    it("forwards metadata facet filters to search", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "test",
+          results: [
+            {
+              doc_id: "doc-1",
+              distance: 0.1,
+              content_type: "text/plain",
+              content: "Inline content",
+            },
+          ],
+        }),
+      );
+
+      await client.retrieve("test", 5, {
+        tags: ["animal"],
+        anyTags: ["dog", "cat"],
+        contentTypes: ["text/plain"],
+        sources: ["slack", "notion"],
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v1/search?");
+      expect(url).toContain("tags=animal");
+      expect(url).toContain("any_tags=dog%2Ccat");
+      expect(url).toContain("content_type=text%2Fplain");
+      expect(url).toContain("source=slack%2Cnotion");
+    });
+
+    it("forwards recency params to search", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "test",
+          results: [
+            {
+              doc_id: "doc-1",
+              score: 80,
+              content_type: "text/plain",
+              content: "Inline content",
+            },
+          ],
+        }),
+      );
+
+      const results = await client.retrieve("test", 5, {
+        recencyWeight: 0.5,
+        halfLifeDays: 7,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v1/search?");
+      expect(url).toContain("recency_weight=0.5");
+      expect(url).toContain("half_life_days=7");
+      // Bridge applies on the RAG path too: score 80 -> distance 0.2.
+      expect(results[0].distance).toBeCloseTo(0.2, 10);
+    });
+
+    it("forwards freshness params to search", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "test",
+          results: [
+            {
+              doc_id: "doc-1",
+              score: 80,
+              content_type: "text/plain",
+              content: "Inline content",
+            },
+          ],
+        }),
+      );
+
+      await client.retrieve("test", 5, {
+        freshnessWeight: 0.4,
+        freshnessHalfLifeDays: 3,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v1/search?");
+      expect(url).toContain("freshness_weight=0.4");
+      expect(url).toContain("freshness_half_life_days=3");
     });
   });
 
@@ -537,38 +1367,59 @@ describe("AetherClient", () => {
       expect(results).toHaveLength(1);
       expect(results[0].doc_id).toBe("a");
       const [url, init] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents/batch");
+      expect(url).toContain("/v1/documents/batch");
       expect(init.method).toBe("POST");
     });
 
-    it("joins each document's tags into a comma-separated string", async () => {
+    it("serializes per-item entity_id verbatim", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({
         results: [{ doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1 }],
       }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
-      await client.batchInsert([{ filename: "a.txt", content: "hello", tags: ["x", "y", "z"] }]);
+      await client.batchInsert([
+        { filename: "a.txt", content: "hello", entity_id: "customer-42" },
+      ]);
       const [, init] = mockFetch.mock.calls[0];
-      const body = JSON.parse(init.body);
-      // Server's batch deserializer expects tags as a comma-joined string, not an array.
-      expect(body.documents[0].tags).toBe("x,y,z");
+      const body = JSON.parse(init.body as string);
+      expect(body.documents[0].entity_id).toBe("customer-42");
     });
 
-    it("omits tags when none are provided", async () => {
+    it("serializes per-item source verbatim", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({
         results: [{ doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1 }],
       }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
-      await client.batchInsert([{ filename: "a.txt", content: "hello" }]);
+      await client.batchInsert([
+        { filename: "a.txt", content: "hello", source: "slack" },
+      ]);
       const [, init] = mockFetch.mock.calls[0];
-      const body = JSON.parse(init.body);
-      expect(body.documents[0].tags).toBeUndefined();
+      const body = JSON.parse(init.body as string);
+      expect(body.documents[0].source).toBe("slack");
+    });
+
+    it("normalizes tags/source on returned records", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [
+          { doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1, tags: ["x"], source: "slack" },
+          { doc_id: "b", cid: "c2", chunks: 1, vectors: 1, version: 1 },
+        ],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      const results = await client.batchInsert([
+        { filename: "a.txt", content: "x" },
+        { filename: "b.txt", content: "y" },
+      ]);
+      expect(results[0].tags).toEqual(["x"]);
+      expect(results[0].source).toBe("slack");
+      expect(results[1].tags).toEqual([]);
+      expect(results[1].source).toBeNull();
     });
   });
 
   describe("batchSearch", () => {
     it("sends POST to /search/batch", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({
-        results: [{ query: "test", results: [{ doc_id: "a", score: 90, content_type: "text/plain" }] }],
+        results: [{ query: "test", results: [{ doc_id: "a", distance: 0.1, content_type: "text/plain" }] }],
       }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       const results = await client.batchSearch([{ q: "test", k: 5 }]);
@@ -576,15 +1427,207 @@ describe("AetherClient", () => {
       expect(results[0].query).toBe("test");
     });
 
-    it("joins each query's tags into a comma-separated string", async () => {
+    it("serializes per-query filter fields verbatim", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({
         results: [{ query: "test", results: [] }],
       }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
-      await client.batchSearch([{ q: "test", k: 5, tags: ["a", "b"] }]);
+      await client.batchSearch([
+        {
+          q: "test",
+          k: 5,
+          entity_id: "customer-42",
+          since: "2026-06-01T00:00:00Z",
+          until: "2026-06-10T23:59:59Z",
+          last_n_days: 30,
+          max_distance: 0.4,
+        },
+      ]);
       const [, init] = mockFetch.mock.calls[0];
-      const body = JSON.parse(init.body);
-      expect(body.queries[0].tags).toBe("a,b");
+      const body = JSON.parse(init.body as string);
+      expect(body.queries[0].entity_id).toBe("customer-42");
+      expect(body.queries[0].since).toBe("2026-06-01T00:00:00Z");
+      expect(body.queries[0].until).toBe("2026-06-10T23:59:59Z");
+      expect(body.queries[0].last_n_days).toBe(30);
+      expect(body.queries[0].max_distance).toBe(0.4);
+    });
+
+    it("serializes per-query metadata facet fields as comma-separated strings", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [{ query: "test", results: [] }],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.batchSearch([
+        {
+          q: "test",
+          tags: ["animal", "mammal"],
+          any_tags: ["dog", "cat"],
+          content_type: ["text/plain", "text/markdown"],
+          source: ["slack", "notion"],
+        },
+      ]);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      // The batch route accepts these facets as comma-separated strings, NOT JSON
+      // arrays — mirror the GET /search CSV convention on the wire.
+      expect(body.queries[0].tags).toBe("animal,mammal");
+      expect(body.queries[0].any_tags).toBe("dog,cat");
+      expect(body.queries[0].content_type).toBe("text/plain,text/markdown");
+      expect(body.queries[0].source).toBe("slack,notion");
+    });
+
+    it("omits empty metadata facet fields from each query", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [{ query: "test", results: [] }],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.batchSearch([{ q: "test", tags: [], any_tags: ["dog"] }]);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body.queries[0]).not.toHaveProperty("tags");
+      expect(body.queries[0].any_tags).toBe("dog");
+      expect(body.queries[0]).not.toHaveProperty("content_type");
+      expect(body.queries[0]).not.toHaveProperty("source");
+    });
+
+    it("normalizes tags/source on nested batch hits", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [
+          {
+            query: "test",
+            results: [
+              { doc_id: "a", distance: 0.1, content_type: "text/plain", tags: ["x"], source: "slack" },
+              { doc_id: "b", distance: 0.2, content_type: "text/plain" },
+            ],
+          },
+        ],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      const results = await client.batchSearch([{ q: "test" }]);
+      expect(results[0].results[0].tags).toEqual(["x"]);
+      expect(results[0].results[0].source).toBe("slack");
+      expect(results[0].results[1].tags).toEqual([]);
+      expect(results[0].results[1].source).toBeNull();
+    });
+
+    it("serializes per-query recency fields verbatim", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [{ query: "test", results: [] }],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.batchSearch([
+        { q: "test", k: 5, recency_weight: 0.3, half_life_days: 14 },
+      ]);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body.queries[0].recency_weight).toBe(0.3);
+      expect(body.queries[0].half_life_days).toBe(14);
+    });
+
+    it("serializes per-query freshness fields verbatim", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [
+          { query: "fresh", results: [] },
+          { query: "plain", results: [] },
+        ],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.batchSearch([
+        { q: "fresh", k: 5, freshness_weight: 0.4, freshness_half_life_days: 7 },
+        { q: "plain" },
+      ]);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body.queries[0].freshness_weight).toBe(0.4);
+      expect(body.queries[0].freshness_half_life_days).toBe(7);
+      expect(body.queries[1]).not.toHaveProperty("freshness_weight");
+      expect(body.queries[1]).not.toHaveProperty("freshness_half_life_days");
+    });
+
+    it("derives distance from score on nested batch hits and reads updated_at", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        results: [
+          {
+            query: "test",
+            results: [
+              {
+                doc_id: "a",
+                score: 60,
+                content_type: "text/plain",
+                updated_at: "2026-06-20T11:00:00Z",
+              },
+              { doc_id: "b", distance: 0.2, content_type: "text/plain" },
+            ],
+          },
+        ],
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      const results = await client.batchSearch([{ q: "test" }]);
+      // score 60 -> distance 0.4
+      expect(results[0].results[0].distance).toBeCloseTo(0.4, 10);
+      expect(results[0].results[0].updated_at).toBe("2026-06-20T11:00:00Z");
+      // legacy distance hit, no updated_at -> null
+      expect(results[0].results[1].distance).toBe(0.2);
+      expect(results[0].results[1].updated_at).toBeNull();
+    });
+  });
+
+  // ── Entity backfill ──────────────────────────────────────────────
+
+  describe("backfillEntityFromTags", () => {
+    it("POSTs to /documents/backfill-entity with tag_prefix and overwrite=false by default", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        scanned: 0,
+        updated: 0,
+        skipped_existing: 0,
+        skipped_no_match: 0,
+        skipped_ambiguous: 0,
+        skipped_invalid: 0,
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.backfillEntityFromTags("patient:");
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v1/documents/backfill-entity");
+      expect(init.method).toBe("POST");
+      const body = JSON.parse(init.body as string);
+      expect(body.tag_prefix).toBe("patient:");
+      expect(body.overwrite).toBe(false);
+    });
+
+    it("forwards overwrite: true", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        scanned: 0,
+        updated: 0,
+        skipped_existing: 0,
+        skipped_no_match: 0,
+        skipped_ambiguous: 0,
+        skipped_invalid: 0,
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.backfillEntityFromTags("patient:", { overwrite: true });
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body.tag_prefix).toBe("patient:");
+      expect(body.overwrite).toBe(true);
+    });
+
+    it("parses the 200 report into the EntityBackfillReport shape", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        scanned: 100,
+        updated: 73,
+        skipped_existing: 12,
+        skipped_no_match: 10,
+        skipped_ambiguous: 4,
+        skipped_invalid: 1,
+      }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      const report = await client.backfillEntityFromTags("patient:");
+      expect(report.scanned).toBe(100);
+      expect(report.updated).toBe(73);
+      expect(report.skipped_existing).toBe(12);
+      expect(report.skipped_no_match).toBe(10);
+      expect(report.skipped_ambiguous).toBe(4);
+      expect(report.skipped_invalid).toBe(1);
     });
   });
 
@@ -597,7 +1640,29 @@ describe("AetherClient", () => {
       const result = await client.insertAsync(new Uint8Array([1, 2, 3]), { filename: "test.bin" });
       expect(result.job_id).toBe("j1");
       const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents/async");
+      expect(url).toContain("/v1/documents/async");
+    });
+
+    it("sends entity_id as URL param when entityId is provided", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ job_id: "j2", status: "pending", poll_url: "/documents/jobs/j2" }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.insertAsync(new Uint8Array([1, 2, 3]), {
+        filename: "test.bin",
+        entityId: "customer-42",
+      });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("entity_id=customer-42");
+    });
+
+    it("sends source as URL param when source is provided", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ job_id: "j3", status: "pending", poll_url: "/documents/jobs/j3" }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.insertAsync(new Uint8Array([1, 2, 3]), {
+        filename: "test.bin",
+        source: "slack",
+      });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("source=slack");
     });
   });
 
@@ -646,233 +1711,552 @@ describe("AetherClient", () => {
       const doc = await client.insertWithEmbeddings({ content: "hello", embedding: [0.1, 0.2] });
       expect(doc.doc_id).toBe("e1");
       const [url, init] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents/embed");
+      expect(url).toContain("/v1/documents/embed");
       expect(init.method).toBe("POST");
+    });
+
+    it("includes entity_id in the JSON body when entityId is provided", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "e2", cid: "c2", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.insertWithEmbeddings({
+        content: "hello",
+        embedding: [0.1, 0.2],
+        entityId: "customer-42",
+      });
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body.entity_id).toBe("customer-42");
+    });
+
+    it("omits entity_id from the JSON body when entityId is not set", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "e3", cid: "c3", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.insertWithEmbeddings({ content: "hello", embedding: [0.1, 0.2] });
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body).not.toHaveProperty("entity_id");
+    });
+
+    it("includes source in the JSON body when source is provided", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "e4", cid: "c4", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.insertWithEmbeddings({
+        content: "hello",
+        embedding: [0.1, 0.2],
+        source: "slack",
+      });
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body.source).toBe("slack");
+    });
+
+    it("omits source from the JSON body when source is not set", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "e5", cid: "c5", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.insertWithEmbeddings({ content: "hello", embedding: [0.1, 0.2] });
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body).not.toHaveProperty("source");
     });
   });
 
   describe("searchByVector", () => {
     it("sends POST to /search/embed", async () => {
-      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [{ doc_id: "a", score: 90, content_type: "text/plain" }] }));
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [{ doc_id: "a", distance: 0.1, content_type: "text/plain" }] }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       const results = await client.searchByVector([0.1, 0.2], 5);
       expect(results).toHaveLength(1);
       const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("/search/embed");
+      expect(url).toContain("/v1/search/embed");
     });
-  });
 
-  // ── entity_id ──────────────────────────────────────────
-
-  describe("entity_id on insert family", () => {
-    function docResponse() {
-      return jsonResponse({
-        doc_id: "e-1",
-        cid: "c1",
-        content_type: "text/plain",
-        size_bytes: 5,
-        chunks: 1,
-        vectors: 1,
-        version: 1,
-        entity_id: "user-42",
+    it("includes entity and time window filters in the JSON body", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.searchByVector([0.1, 0.2], 5, {
+        entityId: "customer-42",
+        since: "2026-06-01T00:00:00Z",
+        until: "2026-06-10T23:59:59Z",
+        lastNDays: 30,
+        maxDistance: 0.4,
       });
-    }
-
-    it("insert maps entityId to the entity_id query param", async () => {
-      mockFetch.mockResolvedValueOnce(docResponse());
-      const data = new TextEncoder().encode("hello");
-      const doc = await client.insert(data, { filename: "a.txt", entityId: "user-42" });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("entity_id=user-42");
-      expect(doc.entity_id).toBe("user-42");
-    });
-
-    it("insertText maps entityId to the entity_id query param", async () => {
-      mockFetch.mockResolvedValueOnce(docResponse());
-      await client.insertText("hello", { entityId: "user-42" });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("entity_id=user-42");
-    });
-
-    it("insertStream maps entityId to the entity_id query param", async () => {
-      mockFetch.mockResolvedValueOnce(docResponse());
-      const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("data"));
-          controller.close();
-        },
-      });
-      await client.insertStream(stream, { entityId: "user-42" });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("entity_id=user-42");
-    });
-
-    it("update maps entityId to the entity_id query param", async () => {
-      mockFetch.mockResolvedValueOnce(docResponse());
-      const data = new TextEncoder().encode("updated");
-      await client.update("e-1", data, { filename: "a.txt", entityId: "user-42" });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("entity_id=user-42");
-    });
-
-    it("insertWithEmbeddings sends entity_id in the JSON body", async () => {
-      mockFetch.mockResolvedValueOnce(docResponse());
-      await client.insertWithEmbeddings({ content: "hello", embedding: [0.1, 0.2], entityId: "user-42" });
       const [, init] = mockFetch.mock.calls[0];
-      expect(JSON.parse(init.body as string).entity_id).toBe("user-42");
+      const body = JSON.parse(init.body as string);
+      expect(body.entity_id).toBe("customer-42");
+      expect(body.since).toBe("2026-06-01T00:00:00Z");
+      expect(body.until).toBe("2026-06-10T23:59:59Z");
+      expect(body.last_n_days).toBe(30);
+      expect(body.max_distance).toBe(0.4);
     });
 
-    it("omits entity_id when not provided", async () => {
-      mockFetch.mockResolvedValueOnce(docResponse());
-      await client.insertText("hello");
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).not.toContain("entity_id");
+    it("omits filter fields from the JSON body when no options are set", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.searchByVector([0.1, 0.2], 5);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body).not.toHaveProperty("entity_id");
+      expect(body).not.toHaveProperty("since");
+      expect(body).not.toHaveProperty("until");
+      expect(body).not.toHaveProperty("last_n_days");
+      expect(body).not.toHaveProperty("max_distance");
+      expect(body).not.toHaveProperty("any_tags");
+      expect(body).not.toHaveProperty("content_type");
+      expect(body).not.toHaveProperty("source");
     });
-  });
 
-  describe("entity_id and time-window filters on search/retrieve/list", () => {
-    it("search forwards entityId, since, until and lastNDays as snake_case params", async () => {
-      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "q", results: [] }));
-      await client.search("q", 5, {
-        entityId: "user-42",
-        since: "2026-01-01T00:00:00Z",
-        until: "2026-02-01T00:00:00Z",
-        lastNDays: 7,
+    it("sends the metadata facet filters as JSON arrays", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.searchByVector([0.1, 0.2], 5, {
+        anyTags: ["dog", "cat"],
+        contentTypes: ["text/plain"],
+        sources: ["slack", "notion"],
       });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("entity_id=user-42");
-      expect(url).toContain("since=2026-01-01");
-      expect(url).toContain("until=2026-02-01");
-      expect(url).toContain("last_n_days=7");
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body.any_tags).toEqual(["dog", "cat"]);
+      expect(body.content_type).toEqual(["text/plain"]);
+      expect(body.source).toEqual(["slack", "notion"]);
     });
 
-    it("search keeps max_distance working alongside the new filters", async () => {
-      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "q", results: [] }));
-      await client.search("q", 5, { maxDistance: 0.3, entityId: "user-42" });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("max_distance=0.3");
-      expect(url).toContain("entity_id=user-42");
-    });
-
-    it("list forwards the filters as snake_case params", async () => {
-      mockFetch.mockResolvedValueOnce(
-        jsonResponse({ documents: [], count: 0, total: 0, has_more: false }),
-      );
-      await client.list({ entityId: "user-42", lastNDays: 30 });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("entity_id=user-42");
-      expect(url).toContain("last_n_days=30");
-    });
-
-    it("retrieve forwards entityId through to search", async () => {
+    it("normalizes tags/source on returned hits", async () => {
       mockFetch.mockResolvedValueOnce(
         jsonResponse({
-          query: "q",
+          query: "",
           results: [
-            { doc_id: "d-1", score: 90, content_type: "text/plain", entity_id: "user-42" },
+            { doc_id: "a", distance: 0.1, content_type: "text/plain", tags: ["x"], source: "slack" },
+            { doc_id: "b", distance: 0.2, content_type: "text/plain" },
           ],
         }),
       );
-      // retrieve() downloads each unique doc's full text (search no longer inlines content).
-      mockFetch.mockResolvedValueOnce(
-        binaryResponse(new TextEncoder().encode("body")),
-      );
-      const results = await client.retrieve("q", 5, { entityId: "user-42" });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("entity_id=user-42");
-      expect(results[0].entity_id).toBe("user-42");
-      expect(results[0].content).toBe("body");
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      const results = await client.searchByVector([0.1, 0.2], 5);
+      expect(results[0].tags).toEqual(["x"]);
+      expect(results[0].source).toBe("slack");
+      expect(results[1].tags).toEqual([]);
+      expect(results[1].source).toBeNull();
     });
 
-    it("searchByVector sends the filters in the JSON body", async () => {
+    it("includes recency_weight and half_life_days in the JSON body", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       await client.searchByVector([0.1, 0.2], 5, {
-        entityId: "user-42",
-        since: "2026-01-01T00:00:00Z",
-        until: "2026-02-01T00:00:00Z",
-        lastNDays: 7,
+        recencyWeight: 0.3,
+        halfLifeDays: 14,
       });
       const [, init] = mockFetch.mock.calls[0];
-      const sent = JSON.parse(init.body as string);
-      expect(sent.entity_id).toBe("user-42");
-      expect(sent.since).toBe("2026-01-01T00:00:00Z");
-      expect(sent.until).toBe("2026-02-01T00:00:00Z");
-      expect(sent.last_n_days).toBe(7);
+      const body = JSON.parse(init.body as string);
+      expect(body.recency_weight).toBe(0.3);
+      expect(body.half_life_days).toBe(14);
+    });
+
+    it("omits recency fields from the JSON body when not set", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.searchByVector([0.1, 0.2], 5);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body).not.toHaveProperty("recency_weight");
+      expect(body).not.toHaveProperty("half_life_days");
+    });
+
+    it("includes freshness_weight and freshness_half_life_days in the JSON body", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.searchByVector([0.1, 0.2], 5, {
+        freshnessWeight: 0.4,
+        freshnessHalfLifeDays: 7,
+      });
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body.freshness_weight).toBe(0.4);
+      expect(body.freshness_half_life_days).toBe(7);
+    });
+
+    it("omits freshness fields from the JSON body when not set", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await client.searchByVector([0.1, 0.2], 5);
+      const [, init] = mockFetch.mock.calls[0];
+      const body = JSON.parse(init.body as string);
+      expect(body).not.toHaveProperty("freshness_weight");
+      expect(body).not.toHaveProperty("freshness_half_life_days");
+    });
+
+    it("derives distance from a score-only hit and reads updated_at", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "",
+          results: [
+            {
+              doc_id: "a",
+              score: 75,
+              content_type: "text/plain",
+              created_at: "2026-06-15T09:30:00Z",
+              updated_at: "2026-06-20T11:00:00Z",
+            },
+          ],
+        }),
+      );
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      const results = await client.searchByVector([0.1, 0.2], 5);
+      expect(results[0].distance).toBeCloseTo(0.25, 10);
+      expect(results[0].created_at).toBe("2026-06-15T09:30:00Z");
+      expect(results[0].updated_at).toBe("2026-06-20T11:00:00Z");
     });
   });
 
-  describe("entity_id on batch operations", () => {
-    it("batchInsert maps per-document entityId to entity_id", async () => {
-      mockFetch.mockResolvedValueOnce(
-        jsonResponse({ results: [{ doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1 }] }),
-      );
-      await client.batchInsert([{ filename: "a.txt", content: "hello", entityId: "user-42" }]);
-      const [, init] = mockFetch.mock.calls[0];
-      const sent = JSON.parse(init.body as string);
-      expect(sent.documents[0].entity_id).toBe("user-42");
-      expect(sent.documents[0]).not.toHaveProperty("entityId");
+  // ── Partition scoping ──────────────────────────────────
+  //
+  // A scoped handle auto-injects `partition` on every partition-aware read
+  // and write; there is no per-call partition argument. The original client
+  // stays unscoped. doc_id-addressed methods never send a partition.
+
+  describe("partition scoping", () => {
+    const base = new AetherClient({ baseUrl: "http://localhost:9000" });
+
+    // ── Handle identity & immutability ──────────────────────────────
+    describe("handle", () => {
+      it("returns a distinct scoped object and leaves the original unscoped", () => {
+        const scoped = base.partition("tenant-a");
+        expect(scoped).not.toBe(base);
+        expect(scoped).toBeInstanceOf(AetherClient);
+      });
+
+      it("the ORIGINAL client sends no partition (byte-identical)", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+        await base.search("hello");
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).not.toContain("partition");
+      });
+
+      it("re-scoping is last-wins", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+        await base.partition("tenant-a").partition("tenant-b").search("hi");
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("partition=tenant-b");
+        expect(url).not.toContain("partition=tenant-a");
+      });
+
+      it("shares config (auth header) with the parent", async () => {
+        const authed = new AetherClient({
+          baseUrl: "http://localhost:9000",
+          apiKey: "aether_secret",
+        });
+        mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+        await authed.partition("tenant-a").search("hi");
+        const [, init] = mockFetch.mock.calls[0];
+        expect(init.headers.Authorization).toBe("Bearer aether_secret");
+      });
     });
 
-    it("batchSearch maps per-query entityId and lastNDays to snake_case", async () => {
+    // ── Query-route injection ───────────────────────────────────────
+    describe("query-route methods send partition as a URL param", () => {
+      it("search", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+        await base.partition("tenant-a").search("hello", 5);
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("/v1/search?");
+        expect(url).toContain("partition=tenant-a");
+      });
+
+      it("insertText", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "d", cid: "c", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+        await base.partition("tenant-a").insertText("hi");
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("/v1/documents?");
+        expect(url).toContain("partition=tenant-a");
+      });
+
+      it("list", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ documents: [], count: 0, total: 0, offset: 0, limit: 0, has_more: false }));
+        await base.partition("tenant-a").list();
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("/v1/documents?");
+        expect(url).toContain("partition=tenant-a");
+      });
+
+      it("insert", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "d", cid: "c", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+        await base.partition("tenant-a").insert(new Uint8Array([1, 2]), { filename: "a.bin" });
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("partition=tenant-a");
+      });
+
+      it("update", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "d", cid: "c", chunks: 1, vectors: 1, version: 2, content_type: "text/plain", size_bytes: 5 }));
+        await base.partition("tenant-a").update("doc-1", new Uint8Array([1]), { filename: "a.bin" });
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("/v1/documents/doc-1?");
+        expect(url).toContain("partition=tenant-a");
+      });
+
+      it("insertAsync", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ job_id: "j", status: "pending", poll_url: "/x" }));
+        await base.partition("tenant-a").insertAsync(new Uint8Array([1]), { filename: "a.bin" });
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("/v1/documents/async?");
+        expect(url).toContain("partition=tenant-a");
+      });
+
+      it("insertStream", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "d", cid: "c", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            controller.close();
+          },
+        });
+        await base.partition("tenant-a").insertStream(stream, { filename: "a.bin" });
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("/v1/documents?");
+        expect(url).toContain("partition=tenant-a");
+      });
+
+      it("retrieve inherits scoping via search (no special-case)", async () => {
+        mockFetch.mockResolvedValueOnce(
+          jsonResponse({ query: "q", results: [{ doc_id: "d1", distance: 0.1, content_type: "text/plain", content: "x" }] }),
+        );
+        await base.partition("tenant-a").retrieve("hello", 3);
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("/v1/search?");
+        expect(url).toContain("partition=tenant-a");
+      });
+
+      it("URL-encodes the partition value like entity_id", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+        await base.partition("tenant:a b").search("hi");
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toContain("partition=tenant%3Aa+b");
+      });
+    });
+
+    // ── JSON-body injection ─────────────────────────────────────────
+    describe("body-route methods send partition as a JSON body field", () => {
+      it("searchByVector", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [] }));
+        await base.partition("tenant-a").searchByVector([0.1, 0.2], 5);
+        const [, init] = mockFetch.mock.calls[0];
+        const body = JSON.parse(init.body as string);
+        expect(body.partition).toBe("tenant-a");
+      });
+
+      it("insertWithEmbeddings", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "e", cid: "c", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+        await base.partition("tenant-a").insertWithEmbeddings({ content: "hi", embedding: [0.1, 0.2] });
+        const [, init] = mockFetch.mock.calls[0];
+        const body = JSON.parse(init.body as string);
+        expect(body.partition).toBe("tenant-a");
+      });
+
+      it("batchInsert stamps the same partition on every item", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ results: [{ doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1 }, { doc_id: "b", cid: "c2", chunks: 1, vectors: 1, version: 1 }] }));
+        await base.partition("tenant-a").batchInsert([
+          { filename: "a.txt", content: "x" },
+          { filename: "b.txt", content: "y" },
+        ]);
+        const [, init] = mockFetch.mock.calls[0];
+        const body = JSON.parse(init.body as string);
+        expect(body.documents[0].partition).toBe("tenant-a");
+        expect(body.documents[1].partition).toBe("tenant-a");
+      });
+
+      it("batchInsert does NOT mutate the caller's array", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ results: [{ doc_id: "a", cid: "c1", chunks: 1, vectors: 1, version: 1 }] }));
+        const docs = [{ filename: "a.txt", content: "x" }];
+        await base.partition("tenant-a").batchInsert(docs);
+        expect(docs[0]).not.toHaveProperty("partition");
+      });
+
+      it("batchSearch stamps the same partition on every query", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ results: [{ query: "a", results: [] }, { query: "b", results: [] }] }));
+        await base.partition("tenant-a").batchSearch([{ q: "a" }, { q: "b" }]);
+        const [, init] = mockFetch.mock.calls[0];
+        const body = JSON.parse(init.body as string);
+        expect(body.queries[0].partition).toBe("tenant-a");
+        expect(body.queries[1].partition).toBe("tenant-a");
+      });
+
+      it("batchSearch does NOT mutate the caller's array", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ results: [{ query: "a", results: [] }] }));
+        const queries = [{ q: "a" }];
+        await base.partition("tenant-a").batchSearch(queries);
+        expect(queries[0]).not.toHaveProperty("partition");
+      });
+    });
+
+    // ── doc_id-addressed methods never send a partition ─────────────
+    describe("doc_id-addressed methods send NO partition even when scoped", () => {
+      it("get", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "doc-1", cid: "c", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
+        await base.partition("tenant-a").get("doc-1");
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toBe("http://localhost:9000/v1/documents/doc-1");
+        expect(url).not.toContain("partition");
+      });
+
+      it("delete", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({}));
+        await base.partition("tenant-a").delete("doc-1");
+        const [url] = mockFetch.mock.calls[0];
+        expect(url).toBe("http://localhost:9000/v1/documents/doc-1");
+        expect(url).not.toContain("partition");
+      });
+
+      it("restore, download, status carry no partition", async () => {
+        mockFetch.mockResolvedValueOnce(jsonResponse({}));
+        await base.partition("tenant-a").restore("doc-1");
+        expect(mockFetch.mock.calls[0][0]).not.toContain("partition");
+
+        mockFetch.mockResolvedValueOnce(binaryResponse(new TextEncoder().encode("x")));
+        await base.partition("tenant-a").download("doc-1");
+        expect(mockFetch.mock.calls[1][0]).not.toContain("partition");
+
+        mockFetch.mockResolvedValueOnce(jsonResponse({ node_id: 0, documents: 0, vectors: 0 }));
+        await base.partition("tenant-a").status();
+        expect(mockFetch.mock.calls[2][0]).not.toContain("partition");
+      });
+    });
+
+    // ── Client-side validation (no HTTP call) ───────────────────────
+    describe("validation rejects bad partition ids with no HTTP call", () => {
+      it("rejects an empty id", () => {
+        expect(() => base.partition("")).toThrow(AetherError);
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+
+      it("rejects a whitespace-only id", () => {
+        expect(() => base.partition("   ")).toThrow(AetherError);
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+
+      it("rejects an id longer than 256 characters", () => {
+        expect(() => base.partition("a".repeat(257))).toThrow(AetherError);
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+
+      it("accepts an id of exactly 256 characters", () => {
+        expect(() => base.partition("a".repeat(256))).not.toThrow();
+      });
+    });
+  });
+});
+
+// ── Usage-feedback capture: query_id on hits + sendSearchFeedback ──
+
+describe("usage feedback", () => {
+  const client = new AetherClient({
+    baseUrl: "http://localhost:9000",
+    apiKey: "aether_testkey123",
+  });
+
+  const hit = { doc_id: "doc-1", score: 90, content_type: "text/plain" };
+
+  describe("query_id on search results", () => {
+    it("stamps the response-level query_id onto every search hit", async () => {
       mockFetch.mockResolvedValueOnce(
-        jsonResponse({ results: [{ query: "q", results: [] }] }),
+        jsonResponse({
+          query: "q",
+          query_id: "11111111-2222-3333-4444-555555555555",
+          results: [hit, { ...hit, doc_id: "doc-2" }],
+        }),
       );
-      await client.batchSearch([
-        { q: "q", k: 5, entityId: "user-42", since: "2026-01-01T00:00:00Z", lastNDays: 7 },
+
+      const results = await client.search("q");
+      expect(results.map((r) => r.queryId)).toEqual([
+        "11111111-2222-3333-4444-555555555555",
+        "11111111-2222-3333-4444-555555555555",
       ]);
-      const [, init] = mockFetch.mock.calls[0];
-      const sent = JSON.parse(init.body as string);
-      expect(sent.queries[0].entity_id).toBe("user-42");
-      expect(sent.queries[0].since).toBe("2026-01-01T00:00:00Z");
-      expect(sent.queries[0].last_n_days).toBe(7);
-      expect(sent.queries[0]).not.toHaveProperty("entityId");
-      expect(sent.queries[0]).not.toHaveProperty("lastNDays");
+    });
+
+    it("leaves queryId undefined when the server omits query_id", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "q", results: [hit] }),
+      );
+
+      const results = await client.search("q");
+      expect(results[0].queryId).toBeUndefined();
+      expect(results[0].doc_id).toBe("doc-1");
+    });
+
+    it("stamps query_id on searchByVector hits", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ query: "", query_id: "qid-embed", results: [hit] }),
+      );
+
+      const results = await client.searchByVector([0.1, 0.2], 5);
+      expect(results[0].queryId).toBe("qid-embed");
+    });
+
+    it("stamps each batch query's own query_id onto its hits", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          results: [
+            { query: "a", query_id: "qid-a", results: [hit] },
+            { query: "b", results: [{ ...hit, doc_id: "doc-2" }] },
+          ],
+        }),
+      );
+
+      const responses = await client.batchSearch([{ q: "a" }, { q: "b" }]);
+      expect(responses[0].results[0].queryId).toBe("qid-a");
+      expect(responses[1].results[0].queryId).toBeUndefined();
     });
   });
 
-  describe("backfillEntityFromTags", () => {
-    it("POSTs tag_prefix and overwrite to /documents/backfill-entity", async () => {
-      mockFetch.mockResolvedValueOnce(
-        jsonResponse({
-          scanned: 10,
-          updated: 5,
-          skipped_existing: 2,
-          skipped_no_match: 3,
-          skipped_ambiguous: 0,
-          skipped_invalid: 0,
-        }),
-      );
-      const report = await client.backfillEntityFromTags("user:", { overwrite: true });
+  describe("sendSearchFeedback", () => {
+    it("POSTs the versioned path with the wire body", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ recorded: true }));
+
+      await client.sendSearchFeedback("qid-1", "doc-1", "used");
+
       const [url, init] = mockFetch.mock.calls[0];
-      expect(url).toContain("/documents/backfill-entity");
+      expect(url).toBe("http://localhost:9000/v1/search/feedback");
       expect(init.method).toBe("POST");
-      const sent = JSON.parse(init.body as string);
-      expect(sent.tag_prefix).toBe("user:");
-      expect(sent.overwrite).toBe(true);
-      expect(report.scanned).toBe(10);
-      expect(report.updated).toBe(5);
-      expect(report.skipped_existing).toBe(2);
-      expect(report.skipped_no_match).toBe(3);
+      expect(JSON.parse(init.body as string)).toEqual({
+        query_id: "qid-1",
+        doc_id: "doc-1",
+        signal: "used",
+      });
     });
 
-    it("defaults overwrite to false", async () => {
+    it("maps 404 (unknown query_id) to AetherApiError", async () => {
       mockFetch.mockResolvedValueOnce(
-        jsonResponse({
-          scanned: 0,
-          updated: 0,
-          skipped_existing: 0,
-          skipped_no_match: 0,
-          skipped_ambiguous: 0,
-          skipped_invalid: 0,
-        }),
+        jsonResponse({ error: "unknown query_id" }, 404),
       );
-      await client.backfillEntityFromTags("user:");
-      const [, init] = mockFetch.mock.calls[0];
-      expect(JSON.parse(init.body as string).overwrite).toBe(false);
+
+      const err = await client
+        .sendSearchFeedback("nope", "doc-1", "cited")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(AetherApiError);
+      expect((err as AetherApiError).status).toBe(404);
     });
 
-    it("rejects an empty tagPrefix", async () => {
-      await expect(client.backfillEntityFromTags("")).rejects.toThrow("tagPrefix");
+    it("maps 400 (invalid signal) to AetherApiError", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ error: "invalid signal", code: "invalid_input" }, 400),
+      );
+
+      const err = await client
+        .sendSearchFeedback("qid-1", "doc-1", "loved" as unknown as "used")
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(AetherApiError);
+      expect((err as AetherApiError).status).toBe(400);
+      expect((err as AetherApiError).errorCode).toBe("invalid_input");
+    });
+
+    it("validates arguments client-side with no HTTP call", async () => {
+      await expect(
+        client.sendSearchFeedback("", "doc-1", "used"),
+      ).rejects.toThrow(AetherError);
+      await expect(
+        client.sendSearchFeedback("qid-1", "", "used"),
+      ).rejects.toThrow(AetherError);
+      await expect(
+        client.sendSearchFeedback("qid-1", "doc-1", "" as unknown as "used"),
+      ).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
     });
   });
 });
