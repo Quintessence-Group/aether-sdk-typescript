@@ -855,7 +855,7 @@ describe("AetherClient", () => {
           results: [
             {
               doc_id: "abc",
-              distance: 0.15,
+              score: 85,
               title: "ML Intro",
               content_type: "text/plain",
             },
@@ -868,7 +868,7 @@ describe("AetherClient", () => {
       expect(url).toContain("q=machine+learning");
       expect(url).toContain("k=5");
       expect(results).toHaveLength(1);
-      expect(results[0].distance).toBe(0.15);
+      expect(results[0].score).toBe(85);
     });
 
     it("defaults k to 10", async () => {
@@ -955,7 +955,7 @@ describe("AetherClient", () => {
           results: [
             {
               doc_id: "a",
-              distance: 0.1,
+              score: 90,
               content_type: "text/plain",
               tags: ["animal", "mammal"],
               source: "slack",
@@ -963,7 +963,7 @@ describe("AetherClient", () => {
             },
             {
               doc_id: "b",
-              distance: 0.2,
+              score: 80,
               content_type: "text/plain",
             },
           ],
@@ -980,8 +980,8 @@ describe("AetherClient", () => {
       expect(results[1].created_at).toBeUndefined();
     });
 
-    it("derives distance from a score-only engine payload and reads created_at/updated_at", async () => {
-      // The deployed engine serves `score` (0-100), not a raw `distance`.
+    it("parses the calibrated score verbatim and reads created_at/updated_at", async () => {
+      // The engine serves a calibrated `score` (0-100, higher = better).
       mockFetch.mockResolvedValueOnce(
         jsonResponse({
           query: "test",
@@ -1003,32 +1003,29 @@ describe("AetherClient", () => {
       );
 
       const results = await client.search("test", 5);
-      // distance = clamp(1 - score/100, 0, 1)
-      expect(results[0].distance).toBeCloseTo(0.1, 10);
-      expect(results[1].distance).toBe(1);
+      // The 0-100 score is surfaced verbatim, never rescaled client-side.
+      expect(results[0].score).toBe(90);
+      expect(results[1].score).toBe(0);
       expect(results[0].created_at).toBe("2026-06-15T09:30:00Z");
       expect(results[0].updated_at).toBe("2026-06-20T11:00:00Z");
       // updated_at defaults to null when the server omits it (never updated).
       expect(results[1].updated_at).toBeNull();
     });
 
-    it("still parses a legacy distance payload (no score) unchanged", async () => {
+    it("preserves the server's descending-score order", async () => {
       mockFetch.mockResolvedValueOnce(
         jsonResponse({
           query: "test",
           results: [
-            {
-              doc_id: "a",
-              distance: 0.15,
-              content_type: "text/plain",
-            },
+            { doc_id: "a", score: 95, content_type: "text/plain" },
+            { doc_id: "b", score: 40, content_type: "text/plain" },
           ],
         }),
       );
 
       const results = await client.search("test", 5);
-      // Explicit distance wins over any derivation.
-      expect(results[0].distance).toBe(0.15);
+      // The client never re-sorts; server order (best score first) is kept.
+      expect(results.map((r) => r.score)).toEqual([95, 40]);
       expect(results[0].updated_at).toBeNull();
     });
 
@@ -1132,8 +1129,8 @@ describe("AetherClient", () => {
         jsonResponse({
           query: "test query",
           results: [
-            { doc_id: "doc-1", distance: 0.1, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-2", distance: 0.3, title: "Doc 2", content_type: "text/plain" },
+            { doc_id: "doc-1", score: 90, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-2", score: 70, title: "Doc 2", content_type: "text/plain" },
           ],
         }),
       );
@@ -1149,7 +1146,7 @@ describe("AetherClient", () => {
       expect(results).toHaveLength(2);
       expect(results[0].doc_id).toBe("doc-1");
       expect(results[0].content).toBe("Content of doc 1");
-      expect(results[0].distance).toBe(0.1);
+      expect(results[0].score).toBe(90);
       expect(results[1].content).toBe("Content of doc 2");
     });
 
@@ -1158,9 +1155,9 @@ describe("AetherClient", () => {
         jsonResponse({
           query: "test",
           results: [
-            { doc_id: "doc-1", distance: 0.1, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-1", distance: 0.2, title: "Doc 1", content_type: "text/plain" },
-            { doc_id: "doc-2", distance: 0.3, title: "Doc 2", content_type: "text/plain" },
+            { doc_id: "doc-1", score: 90, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-1", score: 80, title: "Doc 1", content_type: "text/plain" },
+            { doc_id: "doc-2", score: 70, title: "Doc 2", content_type: "text/plain" },
           ],
         }),
       );
@@ -1174,8 +1171,8 @@ describe("AetherClient", () => {
       const results = await client.retrieve("test", 5);
       // Should only have 2 results despite 3 search hits
       expect(results).toHaveLength(2);
-      // Should keep the closest match (distance 0.1, not 0.2)
-      expect(results[0].distance).toBe(0.1);
+      // Should keep the best-scoring match (score 90, not 80)
+      expect(results[0].score).toBe(90);
     });
 
     it("forwards entity and time window filters to search", async () => {
@@ -1185,7 +1182,7 @@ describe("AetherClient", () => {
           results: [
             {
               doc_id: "doc-1",
-              distance: 0.1,
+              score: 90,
               content_type: "text/plain",
               content: "Inline content",
             },
@@ -1217,7 +1214,7 @@ describe("AetherClient", () => {
           results: [
             {
               doc_id: "doc-1",
-              distance: 0.1,
+              score: 90,
               content_type: "text/plain",
               content: "Inline content",
             },
@@ -1264,8 +1261,8 @@ describe("AetherClient", () => {
       expect(url).toContain("/v1/search?");
       expect(url).toContain("recency_weight=0.5");
       expect(url).toContain("half_life_days=7");
-      // Bridge applies on the RAG path too: score 80 -> distance 0.2.
-      expect(results[0].distance).toBeCloseTo(0.2, 10);
+      // The calibrated score flows through the RAG path untouched.
+      expect(results[0].score).toBe(80);
     });
 
     it("forwards freshness params to search", async () => {
@@ -1419,7 +1416,7 @@ describe("AetherClient", () => {
   describe("batchSearch", () => {
     it("sends POST to /search/batch", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({
-        results: [{ query: "test", results: [{ doc_id: "a", distance: 0.1, content_type: "text/plain" }] }],
+        results: [{ query: "test", results: [{ doc_id: "a", score: 90, content_type: "text/plain" }] }],
       }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       const results = await client.batchSearch([{ q: "test", k: 5 }]);
@@ -1496,8 +1493,8 @@ describe("AetherClient", () => {
           {
             query: "test",
             results: [
-              { doc_id: "a", distance: 0.1, content_type: "text/plain", tags: ["x"], source: "slack" },
-              { doc_id: "b", distance: 0.2, content_type: "text/plain" },
+              { doc_id: "a", score: 90, content_type: "text/plain", tags: ["x"], source: "slack" },
+              { doc_id: "b", score: 80, content_type: "text/plain" },
             ],
           },
         ],
@@ -1544,7 +1541,7 @@ describe("AetherClient", () => {
       expect(body.queries[1]).not.toHaveProperty("freshness_half_life_days");
     });
 
-    it("derives distance from score on nested batch hits and reads updated_at", async () => {
+    it("parses score on nested batch hits and reads updated_at", async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({
         results: [
           {
@@ -1556,18 +1553,17 @@ describe("AetherClient", () => {
                 content_type: "text/plain",
                 updated_at: "2026-06-20T11:00:00Z",
               },
-              { doc_id: "b", distance: 0.2, content_type: "text/plain" },
+              { doc_id: "b", score: 80, content_type: "text/plain" },
             ],
           },
         ],
       }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       const results = await client.batchSearch([{ q: "test" }]);
-      // score 60 -> distance 0.4
-      expect(results[0].results[0].distance).toBeCloseTo(0.4, 10);
+      expect(results[0].results[0].score).toBe(60);
       expect(results[0].results[0].updated_at).toBe("2026-06-20T11:00:00Z");
-      // legacy distance hit, no updated_at -> null
-      expect(results[0].results[1].distance).toBe(0.2);
+      // hit with no updated_at -> null (never updated since insert)
+      expect(results[0].results[1].score).toBe(80);
       expect(results[0].results[1].updated_at).toBeNull();
     });
   });
@@ -1762,7 +1758,7 @@ describe("AetherClient", () => {
 
   describe("searchByVector", () => {
     it("sends POST to /search/embed", async () => {
-      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [{ doc_id: "a", distance: 0.1, content_type: "text/plain" }] }));
+      mockFetch.mockResolvedValueOnce(jsonResponse({ query: "", results: [{ doc_id: "a", score: 90, content_type: "text/plain" }] }));
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       const results = await client.searchByVector([0.1, 0.2], 5);
       expect(results).toHaveLength(1);
@@ -1825,8 +1821,8 @@ describe("AetherClient", () => {
         jsonResponse({
           query: "",
           results: [
-            { doc_id: "a", distance: 0.1, content_type: "text/plain", tags: ["x"], source: "slack" },
-            { doc_id: "b", distance: 0.2, content_type: "text/plain" },
+            { doc_id: "a", score: 90, content_type: "text/plain", tags: ["x"], source: "slack" },
+            { doc_id: "b", score: 80, content_type: "text/plain" },
           ],
         }),
       );
@@ -1884,7 +1880,7 @@ describe("AetherClient", () => {
       expect(body).not.toHaveProperty("freshness_half_life_days");
     });
 
-    it("derives distance from a score-only hit and reads updated_at", async () => {
+    it("parses the calibrated score and reads updated_at", async () => {
       mockFetch.mockResolvedValueOnce(
         jsonResponse({
           query: "",
@@ -1901,7 +1897,7 @@ describe("AetherClient", () => {
       );
       const client = new AetherClient({ baseUrl: "http://localhost:9000" });
       const results = await client.searchByVector([0.1, 0.2], 5);
-      expect(results[0].distance).toBeCloseTo(0.25, 10);
+      expect(results[0].score).toBe(75);
       expect(results[0].created_at).toBe("2026-06-15T09:30:00Z");
       expect(results[0].updated_at).toBe("2026-06-20T11:00:00Z");
     });
@@ -2016,7 +2012,7 @@ describe("AetherClient", () => {
 
       it("retrieve inherits scoping via search (no special-case)", async () => {
         mockFetch.mockResolvedValueOnce(
-          jsonResponse({ query: "q", results: [{ doc_id: "d1", distance: 0.1, content_type: "text/plain", content: "x" }] }),
+          jsonResponse({ query: "q", results: [{ doc_id: "d1", score: 90, content_type: "text/plain", content: "x" }] }),
         );
         await base.partition("tenant-a").retrieve("hello", 3);
         const [url] = mockFetch.mock.calls[0];

@@ -50,3 +50,5 @@ export type {
   TracedSearch,
   IsolationCheck,
 } from "./models.js";
+export { formatContext, DEFAULT_TEMPLATE } from "./rag.js";
+export type { FormatContextOptions, FormatContextResult } from "./rag.js";

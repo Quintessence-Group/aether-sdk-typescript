@@ -40,7 +40,7 @@ function binaryResponse(text: string): Response {
 /** A search/retrieve `{query, results}` envelope with inlined content so the
  *  raw `retrieve` does not issue extra download calls. */
 function retrieveResponse(
-  results: Array<{ doc_id: string; distance: number; content: string }>,
+  results: Array<{ doc_id: string; score: number; content: string }>,
 ): Response {
   return jsonResponse({
     query: "q",
@@ -90,7 +90,7 @@ describe("Memory", () => {
 
     it("recall sends entity_id as the filter", async () => {
       mockFetch.mockResolvedValueOnce(
-        retrieveResponse([{ doc_id: "d", distance: 0.2, content: "x" }]),
+        retrieveResponse([{ doc_id: "d", score: 80, content: "x" }]),
       );
       const mem = newMemory("patient-john");
       await mem.recall("anxiety");
@@ -225,8 +225,8 @@ describe("Memory", () => {
     it("issues exactly one retrieve call, created_at null, server order preserved", async () => {
       mockFetch.mockResolvedValueOnce(
         retrieveResponse([
-          { doc_id: "first", distance: 0.10, content: "A" },
-          { doc_id: "second", distance: 0.40, content: "B" },
+          { doc_id: "first", score: 90, content: "A" },
+          { doc_id: "second", score: 60, content: "B" },
         ]),
       );
       const mem = newMemory("patient-john");
@@ -241,9 +241,9 @@ describe("Memory", () => {
       expect(items.map((i) => i.id)).toEqual(["first", "second"]);
       expect(items[0].createdAt).toBeUndefined();
       expect(items[1].createdAt).toBeUndefined();
-      // similarity = 1/(1+distance)
-      expect(items[0].score).toBeCloseTo(1 / 1.1, 10);
-      expect(items[1].score).toBeCloseTo(1 / 1.4, 10);
+      // similarity = score/100
+      expect(items[0].score).toBeCloseTo(0.9, 10);
+      expect(items[1].score).toBeCloseTo(0.6, 10);
     });
 
     it("forwards since/until to the retrieve call", async () => {
@@ -284,14 +284,14 @@ describe("Memory", () => {
       // inputs and this exact asserted order must be identical in all four SDKs.
       const now = () => new Date("2026-06-15T00:00:00Z");
 
-      // retrieve returns candidates in server order (ascending distance).
+      // retrieve returns candidates in server order (descending score).
       mockFetch.mockResolvedValueOnce(
         retrieveResponse([
-          { doc_id: "doc-e", distance: 0.05, content: "E" }, // best distance, null ts
-          { doc_id: "doc-a", distance: 0.1, content: "A" }, // 165 days old
-          { doc_id: "doc-b", distance: 0.2, content: "B" }, // 1 day (freshest)
-          { doc_id: "doc-c", distance: 0.3, content: "C" }, // 5 days
-          { doc_id: "doc-d", distance: 0.4, content: "D" }, // 30 days = 1 half-life
+          { doc_id: "doc-e", score: 95, content: "E" }, // best score, null ts
+          { doc_id: "doc-a", score: 90, content: "A" }, // 165 days old
+          { doc_id: "doc-b", score: 80, content: "B" }, // 1 day (freshest)
+          { doc_id: "doc-c", score: 70, content: "C" }, // 5 days
+          { doc_id: "doc-d", score: 60, content: "D" }, // 30 days = 1 half-life
         ]),
       );
 
@@ -335,11 +335,11 @@ describe("Memory", () => {
       // Canonical blended scores (assert within 1e-6 of the §8.1 values).
       const within1e6 = (actual: number | undefined, expected: number) =>
         expect(Math.abs((actual as number) - expected)).toBeLessThanOrEqual(1e-6);
-      within1e6(items[0].score, 0.905246); // doc-b
-      within1e6(items[1].score, 0.830065); // doc-c
-      within1e6(items[2].score, 0.607143); // doc-d
-      within1e6(items[3].score, 0.47619); // doc-e (null ts -> recency 0)
-      within1e6(items[4].score, 0.465594); // doc-a (165 days old)
+      within1e6(items[0].score, 0.888580); // doc-b
+      within1e6(items[1].score, 0.795449); // doc-c
+      within1e6(items[2].score, 0.550000); // doc-d
+      within1e6(items[3].score, 0.475000); // doc-e (null ts -> recency 0)
+      within1e6(items[4].score, 0.461049); // doc-a (165 days old)
       // created_at populated in recency mode; null for doc-e.
       expect(items[0].createdAt).toBe("2026-06-14T00:00:00Z");
       expect(items[3].createdAt).toBeUndefined();
@@ -349,9 +349,9 @@ describe("Memory", () => {
       const now = () => new Date("2026-06-15T00:00:00Z");
       mockFetch.mockResolvedValueOnce(
         retrieveResponse([
-          { doc_id: "doc-a", distance: 0.1, content: "A" },
-          { doc_id: "doc-b", distance: 0.5, content: "B" },
-          { doc_id: "doc-c", distance: 0.25, content: "C" },
+          { doc_id: "doc-a", score: 90, content: "A" },
+          { doc_id: "doc-b", score: 50, content: "B" },
+          { doc_id: "doc-c", score: 75, content: "C" },
         ]),
       );
       const nowMs = Date.parse("2026-06-15T00:00:00Z");
@@ -385,8 +385,8 @@ describe("Memory", () => {
       const now = () => new Date("2026-06-15T00:00:00Z");
       mockFetch.mockResolvedValueOnce(
         retrieveResponse([
-          { doc_id: "doc-old", distance: 0.1, content: "old" },
-          { doc_id: "doc-new", distance: 0.9, content: "new" },
+          { doc_id: "doc-old", score: 90, content: "old" },
+          { doc_id: "doc-new", score: 10, content: "new" },
         ]),
       );
       const nowMs = Date.parse("2026-06-15T00:00:00Z");
@@ -572,25 +572,49 @@ describe("Memory", () => {
     });
   });
 
-  // ── extract_facts reserved no-op ────────────────────────────────────
-  describe("extractFacts reserved no-op", () => {
-    it("stores a single memory regardless of the flag (one HTTP call)", async () => {
-      mockFetch.mockResolvedValueOnce(
-        jsonResponse({
-          doc_id: "doc-1",
-          cid: "",
-          content_type: "text/plain",
-          size_bytes: 10,
-          chunks: 1,
-          vectors: 1,
-          version: 1,
-          created_at: "2026-06-15T00:00:00Z",
-        }),
-      );
+  // ── extractFacts constructor default + per-call override ──────────
+  describe("extractFacts default + per-call override", () => {
+    function insertResponse() {
+      return jsonResponse({
+        doc_id: "doc-1",
+        cid: "",
+        content_type: "text/plain",
+        size_bytes: 10,
+        chunks: 1,
+        vectors: 1,
+        version: 1,
+        created_at: "2026-06-15T00:00:00Z",
+      });
+    }
+
+    it("constructor flag makes remember request extraction by default (one HTTP call)", async () => {
+      mockFetch.mockResolvedValueOnce(insertResponse());
       const mem = newMemory("patient-john", { extractFacts: true });
       const item = await mem.remember("fact one. fact two. fact three.");
-      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(1); // fan-out happens server-side
+      expect(call(0).url).toContain("extract_facts=true");
       expect(item.text).toBe("fact one. fact two. fact three.");
+    });
+
+    it("per-call extract: false overrides the constructor default", async () => {
+      mockFetch.mockResolvedValueOnce(insertResponse());
+      const mem = newMemory("patient-john", { extractFacts: true });
+      await mem.remember("fact one.", undefined, { extract: false });
+      expect(call(0).url).not.toContain("extract_facts");
+    });
+
+    it("per-call extract: true overrides the default-off constructor", async () => {
+      mockFetch.mockResolvedValueOnce(insertResponse());
+      const mem = newMemory("patient-john");
+      await mem.remember("fact one.", undefined, { extract: true });
+      expect(call(0).url).toContain("extract_facts=true");
+    });
+
+    it("default-off sends no extract_facts param", async () => {
+      mockFetch.mockResolvedValueOnce(insertResponse());
+      const mem = newMemory("patient-john");
+      await mem.remember("fact one.");
+      expect(call(0).url).not.toContain("extract_facts");
     });
   });
 
@@ -626,7 +650,7 @@ describe("Memory", () => {
 
     it("recall on a partition-scoped client sends both partition and entity_id", async () => {
       mockFetch.mockResolvedValueOnce(
-        retrieveResponse([{ doc_id: "d", distance: 0.2, content: "x" }]),
+        retrieveResponse([{ doc_id: "d", score: 80, content: "x" }]),
       );
       const client = new AetherClient({
         baseUrl: "http://localhost:9000",
@@ -643,7 +667,7 @@ describe("Memory", () => {
   });
 });
 
-// ── Part II — memory graph (MEMORY_CONTRACT.md §14) ────
+// ── Part II — memory graph (MEMORY_CONTRACT.md §14) ─────────────────────
 
 function entityWire(over: Record<string, unknown> = {}) {
   return {

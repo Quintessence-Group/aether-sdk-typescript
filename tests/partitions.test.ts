@@ -134,7 +134,7 @@ describe("partitions", () => {
     return {
       query: "q",
       results: [
-        { doc_id: "d1", distance: 0.1, content_type: "text/plain" },
+        { doc_id: "d1", score: 90, content_type: "text/plain" },
       ].slice(0, results),
       trace: {
         scoped_to: "client-a",

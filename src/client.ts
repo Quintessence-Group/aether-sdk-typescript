@@ -38,6 +38,63 @@ function getEnv(key: string): string | undefined {
   return undefined;
 }
 
+/**
+ * SDK version, injected at build time from package.json (see the `define`
+ * blocks in tsup.config.ts and vitest.config.ts) so it can never drift from
+ * the package metadata. Falls back to a neutral placeholder when compiled
+ * without the injection (e.g. a raw `tsc` build).
+ */
+declare const __AETHER_SDK_VERSION__: string | undefined;
+const SDK_VERSION: string =
+  typeof __AETHER_SDK_VERSION__ === "string" ? __AETHER_SDK_VERSION__ : "0.0.0";
+
+/**
+ * User-Agent string for outgoing requests, so the server can attribute
+ * traffic by SDK + version. Returns undefined in browsers, where User-Agent
+ * is a forbidden header and cannot be set.
+ */
+function userAgent(): string | undefined {
+  if (typeof process !== "undefined" && process?.versions?.node) {
+    return `aether-sdk-typescript/${SDK_VERSION} (node/${process.versions.node})`;
+  }
+  return undefined;
+}
+
+/** RFC 4122 v4 UUID, using Web Crypto when available with a safe fallback. */
+function randomUUID(): string {
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
+    const r = (Math.random() * 16) | 0;
+    const v = ch === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/**
+ * Throw if an API key would be sent over cleartext HTTP to a non-loopback
+ * host. Loopback addresses are allowed so local development against a
+ * non-TLS node still works.
+ */
+function enforceSecureBaseUrl(baseUrl: string, apiKey: string | undefined): void {
+  if (!apiKey) return;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return; // malformed URLs surface later at request time
+  }
+  if (url.protocol !== "http:") return;
+  const host = url.hostname;
+  if (LOOPBACK_HOSTS.has(host) || host.endsWith(".localhost")) return;
+  throw new AetherError(
+    `Refusing to send API key over insecure HTTP to "${host}". ` +
+      `Use an https:// base URL, or omit the API key for local non-TLS endpoints.`,
+  );
+}
+
 export interface AetherClientOptions {
   /**
    * Base URL of the Aether API.
@@ -156,8 +213,13 @@ export class AetherClient {
       getEnv("AETHER_BASE_URL") ??
       "https://api.aetherdb.ai"
     ).replace(/\/+$/, "");
-    this.headers = {};
     const apiKey = options.apiKey ?? getEnv("AETHER_API_KEY");
+    enforceSecureBaseUrl(this.baseUrl, apiKey);
+    this.headers = {};
+    const ua = userAgent();
+    if (ua) {
+      this.headers["User-Agent"] = ua;
+    }
     if (apiKey) {
       this.headers["Authorization"] = `Bearer ${apiKey}`;
     }
@@ -267,32 +329,12 @@ export class AetherClient {
   }
 
   /**
-   * Resolve a search hit's `distance` from an engine response.
-   *
-   * The engine serves a calibrated `score` (0–100, higher = better) per hit;
-   * older payloads and unit-test fixtures carry a raw `distance` (0 = exact,
-   * ~1 = unrelated). Prefer an explicit `distance` when present, otherwise
-   * derive it from `score` as `clamp(1 - score/100, 0, 1)` so the SDK's
-   * distance-based surfaces (RAG retrieval, the {@link Memory} recency blend)
-   * keep working against the current engine wire format. Mirrors the Python
-   * SDK's `_hit_distance` helper.
-   */
-  private static hitDistance(r: SearchResult & { score?: number }): number {
-    if (r.distance != null) return r.distance;
-    if (r.score != null) {
-      return Math.max(0, Math.min(1, 1 - r.score / 100));
-    }
-    return 1;
-  }
-
-  /**
    * Normalize a raw search hit so `tags` defaults to `[]` and `source` defaults
-   * to `null` when the server omits them (older payloads), and `distance` is
-   * derived from the engine's `score` when no explicit `distance` is present
-   * (see {@link hitDistance}). `created_at` is left as-is (the wire string, or
-   * `undefined` when absent); `updated_at` follows the same convention but
-   * defaults to `null` when the server omits it (the document has never been
-   * updated since insert).
+   * to `null` when the server omits them (older payloads). The engine's
+   * calibrated `score` (0–100, higher = better) is surfaced verbatim.
+   * `created_at` is left as-is (the wire string, or `undefined` when absent);
+   * `updated_at` follows the same convention but defaults to `null` when the
+   * server omits it (the document has never been updated since insert).
    *
    * `queryId` is the response-level feedback handle (present only when
    * usage-feedback capture is enabled for the tenant); it is stamped onto every
@@ -302,7 +344,6 @@ export class AetherClient {
   private static normalizeResult(r: SearchResult, queryId?: string): SearchResult {
     return {
       ...r,
-      distance: AetherClient.hitDistance(r),
       tags: r.tags ?? [],
       source: r.source ?? null,
       metadata: r.metadata ?? {},
@@ -346,12 +387,20 @@ export class AetherClient {
     const maxAttempts = 1 + this.maxRetries; // initial + retries
     let lastError: Error | undefined;
 
+    // Attach a stable idempotency key to non-idempotent writes so the server
+    // can deduplicate a retry whose original response was lost in transit.
+    // Computed once here so every attempt of this call reuses the same key.
+    const baseHeaders: Record<string, string> = { ...this.headers };
+    if ((init.method ?? "GET").toUpperCase() === "POST") {
+      baseHeaders["Idempotency-Key"] = randomUUID();
+    }
+
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let response: Response | undefined;
       try {
         response = await fetch(url, {
           ...init,
-          headers: { ...this.headers, ...init?.headers },
+          headers: { ...baseHeaders, ...init?.headers },
           signal: AbortSignal.timeout(this.timeout),
         });
 
@@ -455,11 +504,15 @@ export class AetherClient {
     init: RequestInit,
   ): Promise<T> {
     const url = `${this.baseUrl}${versionedPath(path)}`;
+    const baseHeaders: Record<string, string> = { ...this.headers };
+    if ((init.method ?? "GET").toUpperCase() === "POST") {
+      baseHeaders["Idempotency-Key"] = randomUUID();
+    }
     let response: Response;
     try {
       response = await fetch(url, {
         ...init,
-        headers: { ...this.headers, ...init?.headers },
+        headers: { ...baseHeaders, ...init?.headers },
         signal: AbortSignal.timeout(this.timeout),
       });
     } catch (err) {
@@ -559,7 +612,7 @@ export class AetherClient {
     return AetherClient.normalizeDocument(record);
   }
 
-  // ── Batch / directory ingestion ─────────────────────────
+  // ── Batch / directory ingestion ───────────────────────────────────
 
   /**
    * Per-file rejections the caller can't fix by retrying the same request:

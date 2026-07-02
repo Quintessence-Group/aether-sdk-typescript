@@ -38,7 +38,11 @@ export interface DocumentRecord {
 
 export interface SearchResult {
   doc_id: string;
-  distance: number;
+  /**
+   * Calibrated relevance, 0–100 (higher = better); ~100 for a near-exact
+   * match. Results are ordered by descending `score`.
+   */
+  score: number;
   title?: string;
   /** Entity the matched document belongs to (e.g. a user or customer id), if any. */
   entity_id?: string;
@@ -137,7 +141,10 @@ export interface BatchSearchQuery {
   until?: string;
   /** Only match documents created in the last N days. Cannot be combined with `since`. */
   last_n_days?: number;
-  /** Drop results whose distance exceeds this threshold. */
+  /**
+   * Drop results whose raw relevance distance exceeds this threshold. Kept in
+   * raw-distance terms (0 = identical); it is not rescaled to the 0–100 `score`.
+   */
   max_distance?: number;
   /**
    * Blend recency into ranking, in `[0, 1]`. `0` (or omitted) leaves results in
@@ -178,7 +185,7 @@ export interface EntityBackfillReport {
   skipped_invalid: number;
 }
 
-// ── Batch / directory ingestion ────────────────────────────
+// ── Batch / directory ingestion ──────────────────────────────────────
 
 /**
  * Outcome of ingesting a single file via {@link AetherClient.ingestFiles} /

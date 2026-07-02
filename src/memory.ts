@@ -98,7 +98,7 @@ export interface MemoryListOptions {
   limit?: number;
 }
 
-// ── Memory graph (Part II, ADR-019) ─────────────────
+// ── Memory graph (Part II, ADR-019) ───────────────────────────────────
 
 /**
  * A scalar memory value: `attributes` entries and a fact `value`. The engine
@@ -387,6 +387,17 @@ function recencyScore(
 }
 
 /**
+ * Normalize a 0–100 calibrated relevance `score` (higher = better) to `[0, 1]`.
+ *
+ * Search hits carry a calibrated `score` (0–100) since the 0.3.0 redesign;
+ * dividing by 100 puts it on the same `[0, 1]` scale as the recency term so the
+ * §4 Mode B blend stays well-defined.
+ */
+function similarity(score: number): number {
+  return score / 100;
+}
+
+/**
  * Entity-scoped, ergonomic facade over {@link AetherClient}.
  *
  * `Memory` **owns** a raw client (composition, not inheritance) and scopes every
@@ -527,7 +538,7 @@ export class Memory {
         createdAt: undefined,
         entityId: this.entityId,
         metadata: h.metadata ?? {},
-        score: 1 / (1 + h.distance),
+        score: similarity(h.score),
       }));
     }
 
@@ -550,17 +561,17 @@ export class Memory {
     const nowMs = this.now().getTime();
     const w = recencyWeight;
     const scored = candidates.map((c) => {
-      const similarity = 1 / (1 + c.distance);
+      const sim = similarity(c.score);
       const createdAt = createdById.get(c.doc_id);
       const recency = recencyScore(createdAt, nowMs, this.halfLifeDays);
-      const blended = (1 - w) * similarity + w * recency;
+      const blended = (1 - w) * sim + w * recency;
       return { c, createdAt, blended };
     });
 
-    // Total order → deterministic: blended DESC, distance ASC, doc_id ASC.
+    // Total order → deterministic: blended DESC, score DESC, doc_id ASC.
     scored.sort((a, b) => {
       if (b.blended !== a.blended) return b.blended - a.blended;
-      if (a.c.distance !== b.c.distance) return a.c.distance - b.c.distance;
+      if (a.c.score !== b.c.score) return b.c.score - a.c.score;
       return a.c.doc_id < b.c.doc_id ? -1 : a.c.doc_id > b.c.doc_id ? 1 : 0;
     });
 
@@ -698,7 +709,7 @@ export class Memory {
     return deleted;
   }
 
-  // ── Memory graph (Part II) ──────────────────────
+  // ── Memory graph (Part II) ────────────────────────────────────────
 
   /** Scoped `/v1/memory/*` request: stamps the owner `entity_id` (partition is
    * injected by the client). */

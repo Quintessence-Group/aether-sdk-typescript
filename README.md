@@ -90,7 +90,7 @@ await client.insertText("Some text content to index");
 // Search
 const results = await client.search("machine learning", 5);
 for (const r of results) {
-  console.log(`  ${r.doc_id} (distance: ${r.distance}) - ${r.passage}`);
+  console.log(`  ${r.doc_id} (score: ${r.score}) - ${r.passage}`);
 }
 ```
 

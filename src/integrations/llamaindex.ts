@@ -160,12 +160,12 @@ export class AetherVectorStore extends BaseVectorStore<AetherClient> {
         new TextNode({
           id_: r.doc_id,
           text: r.content ?? r.passage ?? "",
-          metadata: { title: r.title, content_type: r.content_type, distance: r.distance },
+          metadata: { title: r.title, content_type: r.content_type, score: r.score },
         }),
       );
-      // Aether returns a relevance distance (smaller = closer); LlamaIndex
-      // expects a similarity where higher is more similar.
-      similarities.push(1 - r.distance);
+      // Aether hits carry a calibrated relevance score (0-100, higher = better);
+      // LlamaIndex expects a [0, 1] similarity where higher is more similar.
+      similarities.push(r.score / 100);
       ids.push(r.doc_id);
     }
     return { nodes, similarities, ids };

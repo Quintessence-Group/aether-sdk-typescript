@@ -38,8 +38,8 @@ function docRecord(doc_id: string) {
   };
 }
 
-function searchResult(doc_id: string, distance: number, content: string) {
-  return { doc_id, distance, content_type: "text/plain", content, title: doc_id };
+function searchResult(doc_id: string, score: number, content: string) {
+  return { doc_id, score, content_type: "text/plain", content, title: doc_id };
 }
 
 function lastCall(): [string, RequestInit] {
@@ -97,7 +97,7 @@ describe("LangChain AetherVectorStore", () => {
 
   it("similaritySearch runs a server-side text search and maps hits to Documents", async () => {
     mockFetch.mockResolvedValueOnce(
-      jsonResponse({ query: "q", results: [searchResult("d1", 0.25, "passage one")] }),
+      jsonResponse({ query: "q", results: [searchResult("d1", 75, "passage one")] }),
     );
     const store = new LangChainStore(client);
     const docs = await store.similaritySearch("find me", 3, { tags: ["x"] });
@@ -113,9 +113,9 @@ describe("LangChain AetherVectorStore", () => {
     expect(url).toContain("include_content=true");
   });
 
-  it("similaritySearchWithScore converts distance to a higher-is-better score", async () => {
+  it("similaritySearchWithScore normalizes the 0-100 score to a [0, 1] similarity", async () => {
     mockFetch.mockResolvedValueOnce(
-      jsonResponse({ query: "q", results: [searchResult("d1", 0.25, "p")] }),
+      jsonResponse({ query: "q", results: [searchResult("d1", 75, "p")] }),
     );
     const store = new LangChainStore(client);
     const [[, score]] = await store.similaritySearchWithScore("q", 1);
@@ -124,7 +124,7 @@ describe("LangChain AetherVectorStore", () => {
 
   it("similaritySearchVectorWithScore uses the bring-your-own-embeddings search", async () => {
     mockFetch.mockResolvedValueOnce(
-      jsonResponse({ query: "", results: [searchResult("d1", 0.1, "p")] }),
+      jsonResponse({ query: "", results: [searchResult("d1", 90, "p")] }),
     );
     const store = new LangChainStore(client);
     const out = await store.similaritySearchVectorWithScore([0.1, 0.2], 2);
@@ -179,7 +179,7 @@ describe("LlamaIndex AetherVectorStore", () => {
 
   it("query runs a server-side text search and returns nodes + similarities", async () => {
     mockFetch.mockResolvedValueOnce(
-      jsonResponse({ query: "q", results: [searchResult("d1", 0.2, "match text")] }),
+      jsonResponse({ query: "q", results: [searchResult("d1", 80, "match text")] }),
     );
     const store = new LlamaIndexStore(client);
     const result = await store.query({
@@ -199,7 +199,7 @@ describe("LlamaIndex AetherVectorStore", () => {
 
   it("query honors a precomputed queryEmbedding via the BYOE search", async () => {
     mockFetch.mockResolvedValueOnce(
-      jsonResponse({ query: "", results: [searchResult("d1", 0.0, "p")] }),
+      jsonResponse({ query: "", results: [searchResult("d1", 100, "p")] }),
     );
     const store = new LlamaIndexStore(client);
     const result = await store.query({

@@ -69,7 +69,7 @@ function normalizeTags(value: unknown): string[] | undefined {
 
 /** Build a LangChain {@link Document} from an Aether search hit. */
 function toDocument(r: SearchResult): Document {
-  const metadata: Record<string, unknown> = { doc_id: r.doc_id, distance: r.distance };
+  const metadata: Record<string, unknown> = { doc_id: r.doc_id, score: r.score };
   if (r.title !== undefined) metadata.title = r.title;
   if (r.content_type) metadata.content_type = r.content_type;
   if (r.source != null) metadata.source = r.source;
@@ -176,9 +176,9 @@ export class AetherVectorStore extends VectorStore {
       includeContent: true,
       tags: filter?.tags,
     });
-    // Aether returns a relevance distance (smaller = closer); LangChain expects
-    // a similarity score where higher is more similar.
-    return results.map((r) => [toDocument(r), 1 - r.distance]);
+    // Aether hits carry a calibrated relevance score (0-100, higher = better);
+    // LangChain expects a [0, 1] similarity score where higher is more similar.
+    return results.map((r) => [toDocument(r), r.score / 100]);
   }
 
   /**
@@ -199,7 +199,7 @@ export class AetherVectorStore extends VectorStore {
       includeContent: true,
       tags: filter?.tags,
     });
-    return results.map((r) => [toDocument(r), 1 - r.distance]);
+    return results.map((r) => [toDocument(r), r.score / 100]);
   }
 
   /** Similarity search by text, returning just the documents. */

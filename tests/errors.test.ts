@@ -106,7 +106,7 @@ describe("aetherApiErrorFromResponse", () => {
   });
 });
 
-// ── Canonical billing-rejection fixtures ──────────────────
+// ── Canonical billing-rejection fixtures ─────────────────────────────────
 // These are the exact wire bodies the engine emits for billing/operator
 // rejections. The factory must map each (status, code) pair to its typed
 // subclass with `.errorCode`, `.status`, and `.body` populated, and fall back
