@@ -176,6 +176,19 @@ export function resolveContentType(filePath: string): string | undefined {
 const MAX_PARTITION_LEN = 256;
 
 /**
+ * Strip trailing slashes from a base URL. A single reverse scan is used rather
+ * than the natural `/\/+$/` regex: that regex is unanchored at the start and
+ * backtracks quadratically on adversarial input (e.g. a host followed by many
+ * slashes and a trailing non-slash), a polynomial-ReDoS footgun. This runs in
+ * guaranteed linear time.
+ */
+function stripTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === 47 /* "/" */) end--;
+  return url.slice(0, end);
+}
+
+/**
  * Canonical public API version prefix. Every data route (documents, search,
  * memory, partitions, archive) is served under this prefix. The public probe
  * route `GET /status` is intentionally unversioned.
@@ -208,11 +221,11 @@ export class AetherClient {
   private readonly partitionId?: string;
 
   constructor(options: AetherClientOptions = {}) {
-    this.baseUrl = (
+    this.baseUrl = stripTrailingSlashes(
       options.baseUrl ??
-      getEnv("AETHER_BASE_URL") ??
-      "https://api.aetherdb.ai"
-    ).replace(/\/+$/, "");
+        getEnv("AETHER_BASE_URL") ??
+        "https://api.aetherdb.ai",
+    );
     const apiKey = options.apiKey ?? getEnv("AETHER_API_KEY");
     enforceSecureBaseUrl(this.baseUrl, apiKey);
     this.headers = {};
