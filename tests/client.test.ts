@@ -662,6 +662,74 @@ describe("AetherClient", () => {
     });
   });
 
+  describe("lineage", () => {
+    it("GETs the signed audit records for a document", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          doc_id: "abc-123",
+          records: [
+            {
+              at: "2026-07-05T12:00:00+00:00",
+              actor: "node:deadbeef",
+              action: "document.inserted",
+              resource: "document:abc-123",
+              outcome: "committed",
+              source: "ledger",
+              proof: {
+                content_id: "blake3:cafe",
+                lamport: 42,
+                node_id: "a".repeat(64),
+                public_key: "pubkeyhex",
+                signature: "sighex",
+                verified: true,
+              },
+            },
+            {
+              at: "2026-07-05T12:05:00+00:00",
+              actor: "node:deadbeef",
+              action: "document.tombstoned",
+              resource: "document:abc-123",
+              outcome: "committed",
+              source: "ledger",
+              proof: {
+                lamport: 43,
+                node_id: "a".repeat(64),
+                public_key: "pubkeyhex",
+                signature: "sighex2",
+                verified: true,
+              },
+            },
+          ],
+        }),
+      );
+
+      const records = await client.lineage("abc-123");
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toBe("http://localhost:9000/v1/audit/records/abc-123");
+      expect(records).toHaveLength(2);
+      expect(records[0].action).toBe("document.inserted");
+      expect(records[0].proof.content_id).toBe("blake3:cafe");
+      expect(records[0].proof.lamport).toBe(42);
+      expect(records[0].proof.verified).toBe(true);
+      // A tombstone omits content_id -> it must come through as undefined.
+      expect(records[1].action).toBe("document.tombstoned");
+      expect(records[1].proof.content_id).toBeUndefined();
+    });
+
+    it("throws on empty docId", async () => {
+      await expect(client.lineage("")).rejects.toThrow("docId");
+    });
+
+    it("throws AetherApiError on 404", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ error: "Document not found" }, 404),
+      );
+      await expect(client.lineage("nonexistent")).rejects.toThrow(
+        AetherApiError,
+      );
+    });
+  });
+
   describe("download", () => {
     it("returns ArrayBuffer", async () => {
       const bytes = new Uint8Array([1, 2, 3, 4]);
@@ -2082,32 +2150,33 @@ describe("AetherClient", () => {
       });
     });
 
-    // ── doc_id-addressed methods never send a partition ─────────────
-    describe("doc_id-addressed methods send NO partition even when scoped", () => {
+    // ── doc_id-addressed methods send the partition as a guard ──────
+    // (the boundary hardening: a scoped handle can no longer reach another
+    // partition's document via a bare doc id — mismatch is the same 404 as
+    // a nonexistent id)
+    describe("doc_id-addressed methods send the partition guard when scoped", () => {
       it("get", async () => {
         mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "doc-1", cid: "c", chunks: 1, vectors: 1, version: 1, content_type: "text/plain", size_bytes: 5 }));
         await base.partition("tenant-a").get("doc-1");
         const [url] = mockFetch.mock.calls[0];
-        expect(url).toBe("http://localhost:9000/v1/documents/doc-1");
-        expect(url).not.toContain("partition");
+        expect(url).toBe("http://localhost:9000/v1/documents/doc-1?partition=tenant-a");
       });
 
       it("delete", async () => {
         mockFetch.mockResolvedValueOnce(jsonResponse({}));
         await base.partition("tenant-a").delete("doc-1");
         const [url] = mockFetch.mock.calls[0];
-        expect(url).toBe("http://localhost:9000/v1/documents/doc-1");
-        expect(url).not.toContain("partition");
+        expect(url).toBe("http://localhost:9000/v1/documents/doc-1?partition=tenant-a");
       });
 
-      it("restore, download, status carry no partition", async () => {
+      it("restore and download carry the guard; status stays unscoped", async () => {
         mockFetch.mockResolvedValueOnce(jsonResponse({}));
         await base.partition("tenant-a").restore("doc-1");
-        expect(mockFetch.mock.calls[0][0]).not.toContain("partition");
+        expect(mockFetch.mock.calls[0][0]).toContain("partition=tenant-a");
 
         mockFetch.mockResolvedValueOnce(binaryResponse(new TextEncoder().encode("x")));
         await base.partition("tenant-a").download("doc-1");
-        expect(mockFetch.mock.calls[1][0]).not.toContain("partition");
+        expect(mockFetch.mock.calls[1][0]).toContain("partition=tenant-a");
 
         mockFetch.mockResolvedValueOnce(jsonResponse({ node_id: 0, documents: 0, vectors: 0 }));
         await base.partition("tenant-a").status();

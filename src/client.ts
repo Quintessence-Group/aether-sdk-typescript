@@ -7,12 +7,19 @@ import {
   aetherApiErrorFromResponse,
 } from "./errors.js";
 import type {
+  AggregateResult,
+  AuditRecord,
   BatchInsertItem,
   BatchSearchQuery,
   BatchSearchResponse,
   ChunkingConfig,
   DocumentRecord,
   EntityBackfillReport,
+  FieldSchema,
+  FieldSchemaInput,
+  QueryGroup,
+  QueryPage,
+  SchemaOps,
   IngestResult,
   IsolationCheck,
   Metadata,
@@ -262,6 +269,11 @@ export class AetherClient {
    * single-tenant key, unscoped calls operate on the default partition. The handle
    * is the ergonomic way to always send it.
    *
+   * ID-addressed calls (`get`, `download` / `downloadText`, `delete`, `restore`,
+   * `update`) send the partition as a **guard**: a doc id that lives in another
+   * partition returns the same 404 as a nonexistent id, so a scoped handle can
+   * never reach across the boundary via a bare doc id.
+   *
    * @param partitionId - The partition to scope every operation to (1–256 chars,
    *   non-empty / non-whitespace).
    * @returns A scoped clone of this client sharing the same transport and config.
@@ -329,8 +341,9 @@ export class AetherClient {
 
   /**
    * Normalize a raw document record so the metadata fields are always present:
-   * `tags` defaults to `[]` and `source` defaults to `null` when the server
-   * omits them (older payloads). Other fields pass through unchanged.
+   * `tags` defaults to `[]` and `source` and `partition` default to `null`
+   * when the server omits them (older payloads; a `null` partition means the
+   * default partition). Other fields pass through unchanged.
    */
   private static normalizeDocument(d: DocumentRecord): DocumentRecord {
     return {
@@ -338,12 +351,14 @@ export class AetherClient {
       tags: d.tags ?? [],
       source: d.source ?? null,
       metadata: d.metadata ?? {},
+      partition: d.partition ?? null,
     };
   }
 
   /**
-   * Normalize a raw search hit so `tags` defaults to `[]` and `source` defaults
-   * to `null` when the server omits them (older payloads). The engine's
+   * Normalize a raw search hit so `tags` defaults to `[]` and `source` and
+   * `partition` default to `null` when the server omits them (older payloads;
+   * a `null` partition means the default partition). The engine's
    * calibrated `score` (0–100, higher = better) is surfaced verbatim.
    * `created_at` is left as-is (the wire string, or `undefined` when absent);
    * `updated_at` follows the same convention but defaults to `null` when the
@@ -360,6 +375,7 @@ export class AetherClient {
       tags: r.tags ?? [],
       source: r.source ?? null,
       metadata: r.metadata ?? {},
+      partition: r.partition ?? null,
       updated_at: r.updated_at ?? null,
       queryId,
     };
@@ -935,6 +951,12 @@ export class AetherClient {
    * Replace an existing document with new content.
    * The document retains its ID but all chunks and vectors are regenerated.
    *
+   * The document's partition is **preserved** when none is in play — an
+   * unscoped update never re-homes the document. On a partition handle the
+   * injected partition must match where the document lives (a mismatch across
+   * named partitions is the same 404 as a nonexistent id); use
+   * {@link moveDocument} to change partitions.
+   *
    * @param docId - ID of the document to replace.
    * @param data - Raw replacement bytes.
    * @param options - Update options.
@@ -1003,6 +1025,9 @@ export class AetherClient {
   /**
    * Get document metadata by ID.
    *
+   * On a partition handle the partition is sent as a guard: a doc id that
+   * lives in a different partition returns the same 404 as a nonexistent id.
+   *
    * @param docId - ID of the document to retrieve.
    * @returns The document metadata record.
    * @throws {AetherError} If docId is empty.
@@ -1011,14 +1036,42 @@ export class AetherClient {
    */
   async get(docId: string): Promise<DocumentRecord> {
     if (!docId) throw new AetherError("docId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
     const record = await this._request<DocumentRecord>(
-      `/documents/${encodeURIComponent(docId)}`,
+      `/documents/${encodeURIComponent(docId)}${query ? `?${query}` : ""}`,
     );
     return AetherClient.normalizeDocument(record);
   }
 
   /**
+   * Fetch the signed provenance/lineage trail for a document.
+   *
+   * Returns the ordered audit records for `docId` — each event (insert,
+   * tombstone, …) carries a cryptographic {@link AuditProof} so the caller can
+   * verify it was signed by the node that committed it. The endpoint is
+   * tenant-scoped by the API key; no partition guard is sent.
+   *
+   * @param docId - ID of the document whose lineage to retrieve.
+   * @returns The document's audit records, in the order the engine reports them.
+   * @throws {AetherError} If docId is empty.
+   * @throws {AetherApiError} On non-2xx API response (e.g. 404 if document not found).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async lineage(docId: string): Promise<AuditRecord[]> {
+    if (!docId) throw new AetherError("docId is required");
+    const body = await this._request<{ doc_id: string; records: AuditRecord[] }>(
+      `/audit/records/${encodeURIComponent(docId)}`,
+    );
+    return body.records;
+  }
+
+  /**
    * Download the raw bytes of a document.
+   *
+   * On a partition handle the partition is sent as a guard: a doc id that
+   * lives in a different partition returns the same 404 as a nonexistent id.
    *
    * @param docId - ID of the document to download.
    * @returns The document content as an ArrayBuffer.
@@ -1028,8 +1081,11 @@ export class AetherClient {
    */
   async download(docId: string): Promise<ArrayBuffer> {
     if (!docId) throw new AetherError("docId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
     return this._requestRaw(
-      `/documents/${encodeURIComponent(docId)}/download`,
+      `/documents/${encodeURIComponent(docId)}/download${query ? `?${query}` : ""}`,
     );
   }
 
@@ -1217,8 +1273,134 @@ export class AetherClient {
   }
 
   /**
+   * Run a structured analytical query over declared typed fields + built-ins.
+   * Exact and deterministic — the analytical read path never consults an
+   * embedding.
+   *
+   * **Mode A** (no `aggregate`) resolves to a {@link QueryPage} of matching
+   * documents, typed-sorted and paginated. **Mode B** (with `aggregate`)
+   * resolves to an {@link AggregateResult} of groups.
+   *
+   * @param options.filter - The unified filter grammar: `{ and | or | not }`
+   *   combinators over `{ field, op, value }` leaves (ops: eq, neq, in, gt, gte,
+   *   lt, lte, between, exists, contains, prefix), or the shorthand metadata map.
+   *   Omit to match every document in scope.
+   * @param options.groupBy - Up to two declared/built-in fields to group by (Mode B).
+   * @param options.aggregate - Aggregates per group, e.g.
+   *   `[{ op: "sum", field: "amount", as: "total" }]`. Ops: count, count_distinct,
+   *   sum, avg, min, max (the numeric ops require an int/float field). Passing this
+   *   selects Mode B.
+   * @param options.sort - Typed multi-key sort, `[{ by, dir }]`. Mode A sorts
+   *   documents by field; Mode B sorts groups by an aggregate output or group key.
+   * @param options.limit - Mode A page size (max 1000); Mode B max groups returned.
+   * @param options.offset - Mode A page offset.
+   * @param options.partition - Partition to scope to; ignored on a partition
+   *   handle (the scope is already fixed).
+   * @throws {AetherApiError} 400 for an unknown field, a type-mismatched literal,
+   *   a non-numeric numeric-aggregate, or a guardrail breach (the scan or
+   *   max-groups cap) — never a silently truncated result.
+   */
+  async query(options?: {
+    filter?: MetadataFilter;
+    groupBy?: string[];
+    aggregate?: Array<Record<string, unknown>>;
+    sort?: Array<{ by: string; dir?: "asc" | "desc" }>;
+    limit?: number;
+    offset?: number;
+    partition?: string;
+  }): Promise<QueryPage | AggregateResult> {
+    const body: Record<string, unknown> = {};
+    if (options?.filter != null) body.filter = options.filter;
+    if (options?.groupBy && options.groupBy.length > 0) body.group_by = options.groupBy;
+    if (options?.aggregate && options.aggregate.length > 0) {
+      body.aggregate = options.aggregate;
+    }
+    if (options?.sort && options.sort.length > 0) body.sort = options.sort;
+    if (options?.limit != null) body.limit = options.limit;
+    if (options?.offset != null && options.offset !== 0) body.offset = options.offset;
+    const scope = this.partitionId ?? options?.partition;
+    if (scope) body.partition = scope;
+
+    const isAggregate = !!(options?.aggregate && options.aggregate.length > 0);
+    const data = await this._request<{
+      documents?: DocumentRecord[];
+      total?: number;
+      has_more?: boolean;
+      groups?: QueryGroup[];
+      total_groups?: number;
+      scanned?: number;
+    }>("/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (isAggregate) {
+      const groups = (data.groups ?? []).map((g) => ({
+        keys: g.keys ?? {},
+        aggregates: g.aggregates ?? {},
+      }));
+      return {
+        groups,
+        total_groups: data.total_groups ?? groups.length,
+        scanned: data.scanned ?? 0,
+      };
+    }
+    const documents = (data.documents ?? []).map(AetherClient.normalizeDocument);
+    return {
+      documents,
+      total: data.total ?? documents.length,
+      has_more: data.has_more ?? false,
+    };
+  }
+
+  /**
+   * Field-schema facade — declare / list / delete the typed fields that
+   * {@link query} filters, sorts, and aggregates over. On a partition handle
+   * every call is pinned to that partition.
+   */
+  get schema(): SchemaOps {
+    const withPartition = (path: string): string => {
+      const params = new URLSearchParams();
+      this.applyPartitionParam(params);
+      const qs = params.toString();
+      return `${path}${qs ? `?${qs}` : ""}`;
+    };
+    return {
+      declareFields: async (fields: FieldSchemaInput[]): Promise<FieldSchema[]> => {
+        const body = await this._request<{ fields: FieldSchema[] }>(
+          withPartition("/schema/fields"),
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ fields }),
+          },
+        );
+        return body.fields;
+      },
+      listFields: async (): Promise<FieldSchema[]> => {
+        const body = await this._request<{ fields: FieldSchema[] }>(
+          withPartition("/schema/fields"),
+        );
+        return body.fields;
+      },
+      deleteField: async (name: string): Promise<FieldSchema[]> => {
+        const body = await this._request<{ fields: FieldSchema[] }>(
+          withPartition(`/schema/fields/${encodeURIComponent(name)}`),
+          { method: "DELETE" },
+        );
+        return body.fields;
+      },
+    };
+  }
+
+  /**
    * Soft-delete (tombstone) a document.
    * The document is hidden from searches and listings but can be restored with {@link restore}.
+   *
+   * On a partition handle the partition is sent as a guard (for both soft and
+   * hard deletes): a doc id that lives in a different partition returns the
+   * same 404 as a nonexistent id.
    *
    * @param docId - ID of the document to delete.
    * @throws {AetherError} If docId is empty.
@@ -1230,14 +1412,21 @@ export class AetherClient {
     // `hard` purges the document permanently (removed from the primary
     // store and both indexes, encryption key shredded — irreversible). The
     // default is a recoverable tombstone.
-    const suffix = options?.hard ? "?hard=true" : "";
-    await this._request(`/documents/${encodeURIComponent(docId)}${suffix}`, {
-      method: "DELETE",
-    });
+    const params = new URLSearchParams();
+    if (options?.hard) params.set("hard", "true");
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    await this._request(
+      `/documents/${encodeURIComponent(docId)}${query ? `?${query}` : ""}`,
+      { method: "DELETE" },
+    );
   }
 
   /**
    * Restore a previously tombstoned document, making it visible in searches and listings again.
+   *
+   * On a partition handle the partition is sent as a guard: a doc id that
+   * lives in a different partition returns the same 404 as a nonexistent id.
    *
    * @param docId - ID of the document to restore.
    * @throws {AetherError} If docId is empty.
@@ -1246,10 +1435,85 @@ export class AetherClient {
    */
   async restore(docId: string): Promise<void> {
     if (!docId) throw new AetherError("docId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
     await this._request(
-      `/documents/${encodeURIComponent(docId)}/restore`,
+      `/documents/${encodeURIComponent(docId)}/restore${query ? `?${query}` : ""}`,
       { method: "POST" },
     );
+  }
+
+  /**
+   * Move a document to another partition (metadata-only).
+   *
+   * The only way to move a document between named partitions. `from` asserts
+   * where the document lives **now** and `to` names the destination; `null`
+   * is meaningful for either — the default partition — not an omission.
+   * Content, `cid`, chunks, and vectors are unchanged (no re-embed);
+   * `version` increments. A wrong `from` assertion, a missing id, or a
+   * tombstoned id all return the same 404 as a nonexistent document (never a
+   * partition-existence oracle), and `to === from` is an idempotent no-op.
+   *
+   * Like {@link deletePartition}, this is deliberately **not** scoped by a
+   * partition handle: a call that crosses the boundary must always name both
+   * partitions explicitly, never inherit one from an implicit scope.
+   *
+   * @param docId - ID of the document to move.
+   * @param options - Move options. Both fields are required.
+   * @param options.from - The partition the document currently lives in, or
+   *   `null` for the default partition.
+   * @param options.to - The destination partition, or `null` for the default
+   *   partition.
+   * @returns The updated document record (with the new `partition` echoed).
+   * @throws {AetherError} If docId is empty, a field is omitted, or a non-null
+   *   partition is empty/whitespace or longer than 256 characters.
+   * @throws {AetherApiError} On non-2xx API response (e.g. 404 if the document
+   *   is missing or `from` does not match where it lives).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async moveDocument(
+    docId: string,
+    options: { from: string | null; to: string | null },
+  ): Promise<DocumentRecord> {
+    if (!docId) throw new AetherError("docId is required");
+    // Both fields must be present on the wire (an explicit `null` names the
+    // default partition), so reject `undefined` — JSON.stringify would drop
+    // the key — and validate non-null ids like a partition handle id.
+    const fields: Array<["from" | "to", string | null | undefined]> = [
+      ["from", options.from],
+      ["to", options.to],
+    ];
+    for (const [name, value] of fields) {
+      if (value === undefined) {
+        throw new AetherError(
+          `${name} is required (use null for the default partition)`,
+        );
+      }
+      if (value === null) continue;
+      if (value.trim().length === 0) {
+        throw new AetherError(
+          `${name} must be null or a non-empty partition id`,
+        );
+      }
+      if (value.length > MAX_PARTITION_LEN) {
+        throw new AetherError(
+          `${name} must be at most ${MAX_PARTITION_LEN} characters`,
+        );
+      }
+    }
+    const record = await this._request<DocumentRecord>(
+      `/documents/${encodeURIComponent(docId)}/move`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to_partition: options.to,
+          expect_partition: options.from,
+        }),
+      },
+    );
+    return AetherClient.normalizeDocument(record);
   }
 
   // ── Search ────────────────────────────────────────────────────────
@@ -1977,6 +2241,9 @@ export class AetherClient {
    * `entity_id` are left alone unless `overwrite` is `true`. This is a metadata-only
    * operation — documents are not re-embedded.
    *
+   * On a partition handle the scan is constrained to the handle's partition
+   * (which also satisfies a multi-tenant key's requirement to name one).
+   *
    * @param tagPrefix - Tag prefix that identifies the entity tag (e.g. `"patient:"`). Must be non-empty.
    * @param opts - Backfill options.
    * @param opts.overwrite - When `true`, replace existing entity ids too. Defaults to `false`.
@@ -1988,13 +2255,19 @@ export class AetherClient {
     tagPrefix: string,
     opts?: { overwrite?: boolean },
   ): Promise<EntityBackfillReport> {
-    return this._request<EntityBackfillReport>("/documents/backfill-entity", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        tag_prefix: tagPrefix,
-        overwrite: opts?.overwrite ?? false,
-      }),
-    });
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    return this._request<EntityBackfillReport>(
+      `/documents/backfill-entity${query ? `?${query}` : ""}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tag_prefix: tagPrefix,
+          overwrite: opts?.overwrite ?? false,
+        }),
+      },
+    );
   }
 }

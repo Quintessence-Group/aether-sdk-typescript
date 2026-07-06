@@ -34,6 +34,12 @@ export interface DocumentRecord {
   source: string | null;
   /** Structured metadata values attached to this document. Defaults to `{}`. */
   metadata: Metadata;
+  /**
+   * The partition this document lives in, or `null` for the default
+   * partition. Echoed on every document response — mirrors the
+   * `entity_id`/`source` convention.
+   */
+  partition: string | null;
 }
 
 export interface SearchResult {
@@ -59,6 +65,12 @@ export interface SearchResult {
   source: string | null;
   /** Structured metadata values attached to the matched document. Defaults to `{}`. */
   metadata: Metadata;
+  /**
+   * The partition the matched document lives in, or `null` for the default
+   * partition. Echoed on every hit — mirrors the `entity_id`/`source`
+   * convention.
+   */
+  partition: string | null;
   /**
    * RFC 3339 timestamp of when the matched document was created, if reported by
    * the server. Kept as the wire string (not parsed to a `Date`), matching how
@@ -302,4 +314,112 @@ export interface IsolationCheck {
   candidatesInScope: number | null;
   /** Any touched partitions other than the handle's (empty when `ok`). */
   leaked: string[];
+}
+
+// ── Signed provenance / lineage ──────────────────────────────────────
+
+/**
+ * Cryptographic proof attached to an audit record, letting a caller verify the
+ * event was produced (and signed) by the node that committed it. Fields are the
+ * wire values verbatim (snake_case), mirroring {@link DocumentRecord}.
+ */
+export interface AuditProof {
+  /**
+   * Content address of the document at the time of the event (e.g.
+   * `"blake3:..."`). Omitted for events that do not reference document
+   * content, such as a tombstone/deletion.
+   */
+  content_id?: string;
+  /** Lamport clock value at which the event was recorded. */
+  lamport: number;
+  /** Id of the node that produced the event (64-char hex). */
+  node_id: string;
+  /** The node's public key (hex) — verify `signature` against it. */
+  public_key: string;
+  /** Signature (hex) over the record, produced by `node_id`. */
+  signature: string;
+  /** Whether the engine verified `signature` against `public_key`. */
+  verified: boolean;
+}
+
+/**
+ * One entry in a document's signed provenance/lineage trail, returned by
+ * {@link AetherClient.lineage}. Fields are the wire values verbatim
+ * (snake_case), mirroring {@link DocumentRecord}.
+ */
+export interface AuditRecord {
+  /** RFC 3339 timestamp of when the event occurred. */
+  at: string;
+  /** Who performed the action (e.g. `"node:<hex>"`). */
+  actor: string;
+  /** The action recorded (e.g. `"document.inserted"`). */
+  action: string;
+  /** The resource the action was performed on (e.g. `"document:<uuid>"`). */
+  resource: string;
+  /** The outcome of the action (e.g. `"committed"`). */
+  outcome: string;
+  /** Where the record was sourced from (e.g. `"ledger"`). */
+  source: string;
+  /** Cryptographic proof for this record. */
+  proof: AuditProof;
+}
+
+// ── Structured query & field schema ─────────────────────────────────
+
+/** A declared typed field for the structured-query layer. Field values are
+ * extracted from document metadata (or passage text via a regex) at ingest time
+ * and become filterable / sortable / aggregatable through `client.query`. */
+export interface FieldSchema {
+  name: string;
+  /** One of `string`, `int`, `float`, `bool`, `datetime`, `string_list`. */
+  type: string;
+  /** Where the value comes from: `{ metadata: "<key>" }` or `{ regex: "<pattern>" }`. */
+  source: Record<string, string>;
+  /** Hard-partition scope; omitted for a tenant-wide field. */
+  partition_scope?: string;
+  /** Active documents whose source value coerced to the declared type. */
+  coverage: number;
+  /** Active documents whose source value was present but failed to coerce. */
+  mismatch_count: number;
+  /** Backfill state; `"complete"` in v1 (synchronous on declare). */
+  backfill: string;
+}
+
+/** Input to `client.schema.declareFields`. */
+export interface FieldSchemaInput {
+  name: string;
+  type: string;
+  source: Record<string, string>;
+  partition_scope?: string;
+}
+
+/** A page of documents from a Mode A `client.query` (mirrors `list`). */
+export interface QueryPage {
+  documents: DocumentRecord[];
+  total: number;
+  has_more: boolean;
+}
+
+/** One group in a Mode B aggregation result. */
+export interface QueryGroup {
+  /** Group-key values by `group_by` field name; empty for a whole-population aggregate. */
+  keys: Record<string, unknown>;
+  /** Computed aggregates by output name (the `as` alias or a default). */
+  aggregates: Record<string, unknown>;
+}
+
+/** The result of a Mode B (aggregation) `client.query`. */
+export interface AggregateResult {
+  groups: QueryGroup[];
+  /** Distinct group count before `limit`. */
+  total_groups: number;
+  /** Documents folded into the aggregation (post-filter). */
+  scanned: number;
+}
+
+/** The `client.schema` facade — declare / list / delete typed fields. */
+export interface SchemaOps {
+  declareFields(fields: FieldSchemaInput[]): Promise<FieldSchema[]>;
+  listFields(): Promise<FieldSchema[]>;
+  deleteField(name: string): Promise<FieldSchema[]>;
 }
