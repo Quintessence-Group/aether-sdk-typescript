@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AetherClient } from "../src/client.js";
-import { AetherError, PartitionRequiredError } from "../src/errors.js";
+import { AetherApiError, AetherError, PartitionRequiredError } from "../src/errors.js";
 
-// Partition lifecycle (listPartitions / deletePartition), provable isolation
-// (searchTrace / verifyIsolation), and the typed partition_required error —
-// all driven through a real client over a mocked `fetch` so the genuine
-// request-building / parse / error-mapping path runs.
+// Partition lifecycle (listPartitions / deletePartition), the partition guard
+// on ID-addressed routes, moveDocument, the partition echo on responses,
+// provable isolation (searchTrace / verifyIsolation), and the typed
+// partition_required error — all driven through a real client over a mocked
+// `fetch` so the genuine request-building / parse / error-mapping path runs.
 
 const mockFetch = vi.fn();
 
@@ -124,6 +125,257 @@ describe("partitions", () => {
     });
   });
 
+  // ── partition guard on ID-addressed routes ────────────────────────
+
+  describe("partition handle guards ID-addressed routes", () => {
+    const record = {
+      doc_id: "d1",
+      cid: "c1",
+      content_type: "text/plain",
+      size_bytes: 1,
+      chunks: 1,
+      vectors: 1,
+      version: 1,
+    };
+
+    it("get injects the handle partition as a query param", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(record));
+      await newClient().partition("client-a").get("d1");
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toBe("http://localhost:9000/v1/documents/d1?partition=client-a");
+    });
+
+    it("get stays unguarded on an unscoped client", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(record));
+      await newClient().get("d1");
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toBe("http://localhost:9000/v1/documents/d1");
+    });
+
+    it("download and downloadText inject the handle partition", async () => {
+      // A fresh Response per call — a body can only be read once.
+      mockFetch.mockImplementation(async () => new Response("hello", { status: 200 }));
+      const scoped = newClient().partition("client-a");
+      await scoped.download("d1");
+      expect(await scoped.downloadText("d1")).toBe("hello");
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      for (const [url] of mockFetch.mock.calls) {
+        expect(url).toBe(
+          "http://localhost:9000/v1/documents/d1/download?partition=client-a",
+        );
+      }
+    });
+
+    it("soft delete injects the handle partition", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ status: "deleted" }));
+      await newClient().partition("client-a").delete("d1");
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(init.method).toBe("DELETE");
+      expect(url).toBe("http://localhost:9000/v1/documents/d1?partition=client-a");
+    });
+
+    it("hard delete keeps hard=true alongside the partition guard", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ status: "deleted" }));
+      await newClient().partition("client-a").delete("d1", { hard: true });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toBe(
+        "http://localhost:9000/v1/documents/d1?hard=true&partition=client-a",
+      );
+    });
+
+    it("restore injects the handle partition", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ status: "restored" }));
+      await newClient().partition("client-a").restore("d1");
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(init.method).toBe("POST");
+      expect(url).toBe(
+        "http://localhost:9000/v1/documents/d1/restore?partition=client-a",
+      );
+    });
+
+    it("backfillEntityFromTags constrains the scan to the handle partition", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          scanned: 0,
+          updated: 0,
+          skipped_existing: 0,
+          skipped_no_match: 0,
+          skipped_ambiguous: 0,
+          skipped_invalid: 0,
+        }),
+      );
+      await newClient().partition("client-a").backfillEntityFromTags("patient:");
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toBe(
+        "http://localhost:9000/v1/documents/backfill-entity?partition=client-a",
+      );
+    });
+
+    it("a mismatched guard surfaces the same 404 as a missing document", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ error: "document not found: d1", code: "document_not_found" }, 404),
+      );
+      try {
+        await newClient().partition("client-b").get("d1");
+        throw new Error("expected a 404");
+      } catch (e) {
+        expect(e).toBeInstanceOf(AetherApiError);
+        expect((e as AetherApiError).status).toBe(404);
+        expect((e as AetherApiError).errorCode).toBe("document_not_found");
+      }
+    });
+  });
+
+  // ── moveDocument ──────────────────────────────────────────────────
+
+  describe("moveDocument", () => {
+    const moved = {
+      doc_id: "d1",
+      cid: "c1",
+      content_type: "text/plain",
+      size_bytes: 1,
+      chunks: 1,
+      vectors: 1,
+      version: 2,
+      partition: "client-b",
+    };
+
+    it("POSTs both wire fields and returns the updated record", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(moved));
+      const record = await newClient().moveDocument("d1", {
+        from: "client-a",
+        to: "client-b",
+      });
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toBe("http://localhost:9000/v1/documents/d1/move");
+      expect(init.method).toBe("POST");
+      expect(JSON.parse(init.body)).toEqual({
+        to_partition: "client-b",
+        expect_partition: "client-a",
+      });
+      expect(record.partition).toBe("client-b");
+      expect(record.version).toBe(2);
+    });
+
+    it("sends explicit nulls for the default partition (keys always present)", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ ...moved, partition: null }));
+      await newClient().moveDocument("d1", { from: "client-a", to: null });
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body).toEqual({ to_partition: null, expect_partition: "client-a" });
+      expect("to_partition" in body).toBe(true);
+      expect("expect_partition" in body).toBe(true);
+    });
+
+    it("is never auto-scoped: a partition handle adds no query param", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse(moved));
+      await newClient()
+        .partition("client-z")
+        .moveDocument("d1", { from: null, to: "client-b" });
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toBe("http://localhost:9000/v1/documents/d1/move");
+      expect(url).not.toContain("partition=");
+    });
+
+    it("surfaces a wrong `from` assertion as the plain not-found 404", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ error: "document not found: d1", code: "document_not_found" }, 404),
+      );
+      try {
+        await newClient().moveDocument("d1", { from: "client-x", to: "client-b" });
+        throw new Error("expected a 404");
+      } catch (e) {
+        expect(e).toBeInstanceOf(AetherApiError);
+        expect((e as AetherApiError).status).toBe(404);
+        expect((e as AetherApiError).errorCode).toBe("document_not_found");
+      }
+    });
+
+    it("rejects an empty docId with no HTTP call", async () => {
+      await expect(
+        newClient().moveDocument("", { from: null, to: "client-b" }),
+      ).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects an omitted field with no HTTP call (null must be explicit)", async () => {
+      await expect(
+        newClient().moveDocument(
+          "d1",
+          { from: "client-a" } as unknown as { from: string | null; to: string | null },
+        ),
+      ).rejects.toThrow(/to is required/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects an empty or oversized partition string with no HTTP call", async () => {
+      await expect(
+        newClient().moveDocument("d1", { from: "  ", to: "client-b" }),
+      ).rejects.toThrow(AetherError);
+      await expect(
+        newClient().moveDocument("d1", { from: null, to: "a".repeat(257) }),
+      ).rejects.toThrow(AetherError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── partition echo on responses ───────────────────────────────────
+
+  describe("partition echo", () => {
+    const base = {
+      cid: "c1",
+      content_type: "text/plain",
+      size_bytes: 1,
+      chunks: 1,
+      vectors: 1,
+      version: 1,
+    };
+
+    it("surfaces partition on a document record, defaulting a missing field to null", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ doc_id: "d1", ...base, partition: "client-a" }),
+      );
+      expect((await newClient().get("d1")).partition).toBe("client-a");
+
+      // Older payloads omit the field entirely → normalized to null.
+      mockFetch.mockResolvedValueOnce(jsonResponse({ doc_id: "d2", ...base }));
+      expect((await newClient().get("d2")).partition).toBeNull();
+    });
+
+    it("surfaces partition on every list item", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          documents: [
+            { doc_id: "d1", ...base, partition: "client-a" },
+            { doc_id: "d2", ...base, partition: null },
+          ],
+          count: 2,
+          total: 2,
+          offset: 0,
+          limit: 10,
+          has_more: false,
+        }),
+      );
+      const { documents } = await newClient().list();
+      expect(documents[0].partition).toBe("client-a");
+      expect(documents[1].partition).toBeNull();
+    });
+
+    it("surfaces partition on every search hit (explicit null = default partition)", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          query: "q",
+          results: [
+            { doc_id: "d1", score: 90, content_type: "text/plain", partition: "client-a" },
+            { doc_id: "d2", score: 80, content_type: "text/plain", partition: null },
+          ],
+        }),
+      );
+      const results = await newClient().search("q");
+      expect(results[0].partition).toBe("client-a");
+      expect(results[1].partition).toBeNull();
+    });
+  });
+
   // ── searchTrace + verifyIsolation ─────────────────────────────────
 
   function traceBody(
@@ -236,6 +488,19 @@ describe("partitions", () => {
         expect((e as PartitionRequiredError).status).toBe(400);
         expect((e as PartitionRequiredError).errorCode).toBe("partition_required");
       }
+    });
+
+    it("maps the strict-scoping 400 on an unguarded by-ID call too", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: "This API key requires every document route to name a partition.",
+            code: "partition_required",
+          },
+          400,
+        ),
+      );
+      await expect(newClient().get("d1")).rejects.toThrow(PartitionRequiredError);
     });
 
     it("a 400 with a different code stays the base API error", async () => {

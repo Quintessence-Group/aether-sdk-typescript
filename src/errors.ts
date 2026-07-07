@@ -76,6 +76,9 @@ export class TenantPausedError extends AetherApiError {
  * `code: "partition_required"`). The key requires every read and write to name
  * a partition; scope the call through a partition handle —
  * `client.partition("<end-client-id>")` — instead of the top-level client.
+ * A key minted with strict scoping additionally raises this on any
+ * ID-addressed call (get/download/delete/restore/update) made without the
+ * partition guard a handle would inject.
  * Not retryable: it is a programming error, not a transient failure.
  */
 export class PartitionRequiredError extends AetherApiError {

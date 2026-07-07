@@ -32,6 +32,8 @@ export {
 } from "./errors.js";
 export type { AetherErrorBody } from "./errors.js";
 export type {
+  AuditProof,
+  AuditRecord,
   DocumentRecord,
   SearchResult,
   SearchFeedbackSignal,
@@ -49,6 +51,12 @@ export type {
   SearchTrace,
   TracedSearch,
   IsolationCheck,
+  FieldSchema,
+  FieldSchemaInput,
+  QueryPage,
+  QueryGroup,
+  AggregateResult,
+  SchemaOps,
 } from "./models.js";
 export { formatContext, DEFAULT_TEMPLATE } from "./rag.js";
 export type { FormatContextOptions, FormatContextResult } from "./rag.js";
