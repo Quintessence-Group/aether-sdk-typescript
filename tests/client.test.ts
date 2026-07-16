@@ -708,12 +708,15 @@ describe("AetherClient", () => {
       expect(url).toBe("http://localhost:9000/v1/audit/records/abc-123");
       expect(records).toHaveLength(2);
       expect(records[0].action).toBe("document.inserted");
-      expect(records[0].proof.content_id).toBe("blake3:cafe");
-      expect(records[0].proof.lamport).toBe(42);
-      expect(records[0].proof.verified).toBe(true);
+      // Ledger records always carry a proof (`proof` is optional only because
+      // access-audit records share the envelope without one).
+      expect(records[0].proof?.content_id).toBe("blake3:cafe");
+      expect(records[0].proof?.lamport).toBe(42);
+      expect(records[0].proof?.verified).toBe(true);
       // A tombstone omits content_id -> it must come through as undefined.
       expect(records[1].action).toBe("document.tombstoned");
-      expect(records[1].proof.content_id).toBeUndefined();
+      expect(records[1].proof).toBeDefined();
+      expect(records[1].proof?.content_id).toBeUndefined();
     });
 
     it("throws on empty docId", async () => {
@@ -727,6 +730,205 @@ describe("AetherClient", () => {
       await expect(client.lineage("nonexistent")).rejects.toThrow(
         AetherApiError,
       );
+    });
+  });
+
+  describe("grounding receipts", () => {
+    it("posts declared source ids and parses private provenance plus a public-safe receipt", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          answer_digest: "blake3:answer-commitment",
+          sources: [{
+            document_id: "doc-1",
+            content_id: "aether:private-cid",
+            rank: 0,
+            retained_signed_event_count: 2,
+            current_content_verified: true,
+            proof: {
+              content_id: "aether:private-cid",
+              lamport: 42,
+              node_id: "source-node-id",
+              public_key: "source-public-key",
+              signature: "source-signature",
+              verified: true,
+            },
+          }],
+          trust: {
+            status: "verified",
+            sources_requested: 1,
+            sources_verified: 1,
+            answer_bound: true,
+          },
+          binding: {
+            algorithm: "blake3-keyed/aether-grounding-binding/v1",
+            source_set_commitment: "blake3:sources",
+            source_evidence_commitment: "blake3:evidence",
+            binding_commitment: "opaque-binding",
+            verification_salt: "authenticated-only-salt",
+          },
+          attestation: {
+            version: "aether-grounding-set-attestation/v1",
+            issued_at: "2026-07-10T00:00:00Z",
+            binding_algorithm: "blake3-keyed/aether-grounding-binding/v1",
+            signer_node_id: "grounding-node-id",
+            signer_public_key: "grounding-public-key",
+            signature: "grounding-signature",
+            verified: true,
+          },
+          receipt: {
+            version: "aether-grounding-receipt/v2",
+            receipt_id: "receipt-1",
+            issued_at: "2026-07-10T00:00:00Z",
+            expires_at: "2026-08-09T00:00:00Z",
+            source_count: 1,
+            verified_source_count: 1,
+            status: "verified",
+            binding_commitment: "opaque-binding",
+            capability_commitment: "blake3:capability",
+            owner_commitment: "blake3:owner",
+            attestation: {
+              signer_node_id: "node-id",
+              signer_public_key: "public-key",
+              signature: "signature",
+              verified: true,
+            },
+            share_url: "/receipts/capability",
+            badge_url: "/receipts/capability/badge.svg",
+          },
+        }),
+      );
+
+      const receipt = await client.createGroundingReceipt(
+        "private answer", ["doc-1"], { share: true },
+      );
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toBe("http://localhost:9000/v1/audit/grounding");
+      expect(JSON.parse(init.body as string)).toEqual({
+        answer: "private answer",
+        source_doc_ids: ["doc-1"],
+        share: true,
+      });
+      expect(receipt.sources[0].content_id).toBe("aether:private-cid");
+      expect(receipt.sources[0].proof?.lamport).toBe(42);
+      expect(receipt.trust.status).toBe("verified");
+      expect(receipt.binding.source_evidence_commitment).toBe("blake3:evidence");
+      expect(receipt.attestation.signature).toBe("grounding-signature");
+      expect(receipt.attestation.verified).toBe(true);
+      expect(receipt.receipt?.share_url).toBe("/receipts/capability");
+      expect(receipt.receipt?.capability_commitment).toBe("blake3:capability");
+      expect(receipt.receipt?.owner_commitment).toBe("blake3:owner");
+      expect(receipt.receipt?.attestation.verified).toBe(true);
+
+    });
+
+    it.each([502, 503])(
+      "does not retry share issuance after a %i response",
+      async (status) => {
+        mockFetch.mockReset();
+        const retryClient = new AetherClient({
+          baseUrl: "http://localhost:9000",
+          maxRetries: 2,
+          retryBaseDelay: 0,
+        });
+        mockFetch
+          .mockResolvedValueOnce(jsonResponse({ error: `first-${status}` }, status))
+          .mockResolvedValueOnce(jsonResponse({ answer_digest: "unexpected" }));
+
+        let error: unknown;
+        try {
+          await retryClient.createGroundingReceipt("answer", ["doc-1"], { share: true });
+        } catch (caught) {
+          error = caught;
+        }
+
+        expect(error).toBeInstanceOf(AetherApiError);
+        expect((error as AetherApiError).status).toBe(status);
+        expect((error as AetherApiError).body.error).toBe(`first-${status}`);
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.each([502, 503])(
+      "retains normal retry behavior for a private receipt after a %i response",
+      async (status) => {
+        mockFetch.mockReset();
+        const retryClient = new AetherClient({
+          baseUrl: "http://localhost:9000",
+          maxRetries: 2,
+          retryBaseDelay: 0,
+        });
+        mockFetch
+          .mockResolvedValueOnce(jsonResponse({ error: `transient-${status}` }, status))
+          .mockResolvedValueOnce(jsonResponse({ answer_digest: "blake3:retried" }));
+
+        const result = await retryClient.createGroundingReceipt("answer", ["doc-1"]);
+
+        expect(result.answer_digest).toBe("blake3:retried");
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+      },
+    );
+
+    it("keeps a receipt private by default and revokes through a void DELETE", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          answer_digest: "blake3:answer-commitment",
+          sources: [],
+          trust: {
+            status: "partial",
+            sources_requested: 0,
+            sources_verified: 0,
+            answer_bound: true,
+          },
+          binding: {
+            algorithm: "blake3-keyed/aether-grounding-binding/v1",
+            source_set_commitment: "blake3:sources",
+            binding_commitment: "opaque-binding",
+            verification_salt: "authenticated-only-salt",
+          },
+        }),
+      );
+      const result = await client.createGroundingReceipt("answer", ["doc-1"]);
+      expect(result.receipt).toBeUndefined();
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body as string)).toEqual({
+        answer: "answer", source_doc_ids: ["doc-1"],
+      });
+
+      mockFetch.mockResolvedValueOnce(new Response(null, { status: 204 }));
+      await client.revokeGroundingReceipt("receipt-1");
+      expect(mockFetch.mock.calls[1][0]).toBe(
+        "http://localhost:9000/v1/audit/receipts/receipt-1",
+      );
+      expect(mockFetch.mock.calls[1][1].method).toBe("DELETE");
+    });
+
+    it("validates required grounding inputs before making a request", async () => {
+      await expect(client.createGroundingReceipt("", ["doc-1"])).rejects.toThrow("answer");
+      await expect(client.createGroundingReceipt("answer", [])).rejects.toThrow("sourceDocIds");
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("injects a partition handle into grounding creation and revocation", async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          answer_digest: "blake3:answer",
+          sources: [],
+          trust: { status: "partial", sources_requested: 0, sources_verified: 0, answer_bound: true },
+          binding: {
+            algorithm: "blake3-keyed/aether-grounding-binding/v1",
+            source_set_commitment: "blake3:sources",
+            binding_commitment: "opaque-binding",
+            verification_salt: "authenticated-only-salt",
+          },
+        }),
+      );
+      const scoped = client.partition("customer-a");
+      await scoped.createGroundingReceipt("answer", ["doc-1"]);
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body as string)).toMatchObject({
+        partition: "customer-a",
+      });
+      mockFetch.mockResolvedValueOnce(new Response(null, { status: 204 }));
+      await scoped.revokeGroundingReceipt("receipt-1");
+      expect(mockFetch.mock.calls[1][0]).toContain("partition=customer-a");
     });
   });
 
@@ -1502,6 +1704,7 @@ describe("AetherClient", () => {
           q: "test",
           k: 5,
           entity_id: "customer-42",
+          threadId: "support-42",
           since: "2026-06-01T00:00:00Z",
           until: "2026-06-10T23:59:59Z",
           last_n_days: 30,
@@ -1511,10 +1714,19 @@ describe("AetherClient", () => {
       const [, init] = mockFetch.mock.calls[0];
       const body = JSON.parse(init.body as string);
       expect(body.queries[0].entity_id).toBe("customer-42");
+      expect(body.queries[0].thread_id).toBe("support-42");
+      expect(body.queries[0]).not.toHaveProperty("threadId");
       expect(body.queries[0].since).toBe("2026-06-01T00:00:00Z");
       expect(body.queries[0].until).toBe("2026-06-10T23:59:59Z");
       expect(body.queries[0].last_n_days).toBe(30);
       expect(body.queries[0].max_distance).toBe(0.4);
+    });
+
+    it("rejects an invalid per-query thread id before transport", async () => {
+      const client = new AetherClient({ baseUrl: "http://localhost:9000" });
+      await expect(client.batchSearch([{ q: "test", threadId: "bad\u0000thread" }]))
+        .rejects.toThrow("threadId");
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it("serializes per-query metadata facet fields as comma-separated strings", async () => {
@@ -2135,18 +2347,25 @@ describe("AetherClient", () => {
 
       it("batchSearch stamps the same partition on every query", async () => {
         mockFetch.mockResolvedValueOnce(jsonResponse({ results: [{ query: "a", results: [] }, { query: "b", results: [] }] }));
-        await base.partition("tenant-a").batchSearch([{ q: "a" }, { q: "b" }]);
+        await base.partition("tenant-a").batchSearch([
+          { q: "a", threadId: "thread-a" },
+          { q: "b", threadId: "thread-b" },
+        ]);
         const [, init] = mockFetch.mock.calls[0];
         const body = JSON.parse(init.body as string);
         expect(body.queries[0].partition).toBe("tenant-a");
         expect(body.queries[1].partition).toBe("tenant-a");
+        expect(body.queries[0].thread_id).toBe("thread-a");
+        expect(body.queries[1].thread_id).toBe("thread-b");
       });
 
       it("batchSearch does NOT mutate the caller's array", async () => {
         mockFetch.mockResolvedValueOnce(jsonResponse({ results: [{ query: "a", results: [] }] }));
-        const queries = [{ q: "a" }];
+        const queries = [{ q: "a", threadId: "thread-a" }];
         await base.partition("tenant-a").batchSearch(queries);
         expect(queries[0]).not.toHaveProperty("partition");
+        expect(queries[0]).not.toHaveProperty("thread_id");
+        expect(queries[0].threadId).toBe("thread-a");
       });
     });
 

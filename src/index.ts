@@ -1,8 +1,10 @@
 export { AetherClient, INGEST_CONTENT_TYPES, resolveContentType } from "./client.js";
 export type { AetherClientOptions } from "./client.js";
-export { Memory } from "./memory.js";
+export { Memory, Thread } from "./memory.js";
 export type {
   MemoryItem,
+  MediaSource,
+  MediaRememberInput,
   MemoryOptions,
   RecallOptions,
   MemoryListOptions,
@@ -28,13 +30,28 @@ export {
   FreeLimitExceededError,
   TenantPausedError,
   PartitionRequiredError,
+  PrincipalPinMismatchError,
   aetherApiErrorFromResponse,
 } from "./errors.js";
 export type { AetherErrorBody } from "./errors.js";
 export type {
+  AccessAuditPage,
+  AccessAuditQuery,
+  AuditOps,
   AuditProof,
   AuditRecord,
+  GroundingReceipt,
+  GroundingBinding,
+  GroundingSetAttestation,
+  GroundingSource,
+  GroundingTrustSignal,
+  ReceiptAttestation,
+  ShareableReceipt,
   DocumentRecord,
+  MediaMemoryRecord,
+  ConversationThread,
+  ThreadAppendInput,
+  ThreadReadOptions,
   SearchResult,
   SearchFeedbackSignal,
   RetrievalResult,

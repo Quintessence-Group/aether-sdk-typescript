@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AetherClient } from "../src/client.js";
-import { Memory } from "../src/memory.js";
+import { Memory, Thread } from "../src/memory.js";
 import {
   AetherApiError,
   AetherError,
@@ -618,6 +618,132 @@ describe("Memory", () => {
     });
   });
 
+  describe("multimodal memory", () => {
+    function mediaResponse(modality: "image" | "audio", text: string) {
+      return jsonResponse({
+        doc_id: "media-1",
+        cid: "cid-media",
+        modality,
+        content_type: modality === "image" ? "image/png" : "audio/wav",
+        derived_text: text,
+        derived_by: "client",
+        created_at: "2026-06-15T00:00:00Z",
+        entity_id: "patient-john",
+        partition: null,
+        metadata: { "aether.media.modality": modality },
+      }, 201);
+    }
+
+    it("uses the remember overload for image bytes", async () => {
+      mockFetch.mockResolvedValueOnce(mediaResponse("image", "A red bicycle."));
+      const mem = newMemory("patient-john");
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+      const item = await mem.remember({
+        image: bytes,
+        caption: "A red bicycle.",
+        metadata: { album: "commute" },
+      });
+
+      expect(item.modality).toBe("image");
+      expect(item.text).toBe("A red bicycle.");
+      const { url, init } = call(0);
+      expect(url).toContain("/v1/memory/media?entity_id=patient-john");
+      const body = JSON.parse(init.body as string);
+      expect(body.modality).toBe("image");
+      expect(body.content_type).toBe("image/png");
+      expect(body.caption).toBe("A red bicycle.");
+      expect(Buffer.from(body.data_base64, "base64")).toEqual(Buffer.from(bytes));
+    });
+
+    it("uses the media passage for recall instead of downloading binary bytes", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        query: "bicycle",
+        results: [{
+          doc_id: "media-1",
+          score: 96,
+          content_type: "image/png",
+          passage: "A red bicycle.",
+          modality: "image",
+        }],
+      }));
+      const mem = newMemory("patient-john");
+
+      const items = await mem.recall("bicycle");
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(items[0].text).toBe("A red bicycle.");
+      expect(items[0].modality).toBe("image");
+    });
+
+    it("uses media metadata when an older search omits the passage", async () => {
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({
+          query: "bicycle",
+          results: [{
+            doc_id: "media-1",
+            score: 96,
+            content_type: "image/png",
+            modality: "image",
+          }],
+        }))
+        .mockResolvedValueOnce(jsonResponse({
+          doc_id: "media-1",
+          cid: "cid-media",
+          content_type: "image/png",
+          size_bytes: 100,
+          chunks: 1,
+          vectors: 1,
+          version: 1,
+          modality: "image",
+          derived_text: "A red bicycle.",
+        }));
+      const mem = newMemory("patient-john");
+
+      const items = await mem.recall("bicycle");
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(call(1).url).toContain("/v1/documents/media-1");
+      expect(call(1).url).not.toContain("/download");
+      expect(items[0].text).toBe("A red bicycle.");
+    });
+
+    it("uses authorized derived_text for list without a binary download", async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({
+        documents: [{
+          doc_id: "media-1",
+          cid: "cid-media",
+          content_type: "audio/wav",
+          modality: "audio",
+          derived_text: "Session transcript.",
+          entity_id: "patient-john",
+        }],
+        total: 1,
+        has_more: false,
+      }));
+      const mem = newMemory("patient-john");
+
+      const items = await mem.list();
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(items[0].text).toBe("Session transcript.");
+      expect(items[0].modality).toBe("audio");
+    });
+
+    it("requires one media input and a transcript when auto-transcription is off", async () => {
+      const mem = newMemory("patient-john");
+      await expect(mem.remember({})).rejects.toThrow("exactly one");
+      await expect(mem.remember({ image: new Uint8Array([1]), audio: new Uint8Array([2]) }))
+        .rejects.toThrow("exactly one");
+      await expect(mem.remember({
+        audio: new Uint8Array([1]),
+        contentType: "audio/wav",
+        transcribe: false,
+      })).rejects.toThrow("explicit transcript");
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
   // ── Partition composition ──────────────────────────────────
   // Memory delegates to the raw client, so building a Memory on a partition
   // handle scopes every operation to BOTH partition and entity — without any
@@ -664,6 +790,227 @@ describe("Memory", () => {
       expect(url).toContain("partition=tenant-x");
       expect(url).toContain("entity_id=patient-john");
     });
+  });
+});
+
+describe("Thread", () => {
+  it("appends through the raw thread route with the Memory entity scope", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({
+      doc_id: "turn-1",
+      cid: "",
+      content_type: "text/plain",
+      size_bytes: 12,
+      chunks: 1,
+      vectors: 1,
+      version: 1,
+      created_at: "2026-07-10T00:00:00Z",
+      entity_id: "patient-john",
+      thread_id: "session-4",
+      turn_index: 0,
+      metadata: { role: "patient" },
+    }));
+    const thread = newMemory().thread("session-4");
+    const item = await thread.append("I slept better", { role: "patient" });
+
+    expect(item.id).toBe("turn-1");
+    expect(item.entityId).toBe("patient-john");
+    const { url, init } = call(0);
+    expect(url).toContain("/v1/threads/session-4/append");
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      text: "I slept better",
+      entity_id: "patient-john",
+      metadata: { role: "patient" },
+    });
+  });
+
+  it("composes bounded recent turns plus de-duplicated semantic matches", async () => {
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse({
+        thread_id: "session-4",
+        documents: [
+          {
+            doc_id: "recent-1",
+            cid: "",
+            content_type: "text/plain",
+            size_bytes: 1,
+            chunks: 1,
+            vectors: 1,
+            version: 1,
+            created_at: "2026-07-09T00:00:00Z",
+            entity_id: "patient-john",
+            thread_id: "session-4",
+            turn_index: 7,
+            metadata: { role: "therapist" },
+          },
+          {
+            doc_id: "recent-2",
+            cid: "",
+            content_type: "text/plain",
+            size_bytes: 1,
+            chunks: 1,
+            vectors: 1,
+            version: 1,
+            created_at: "2026-07-10T00:00:00Z",
+            entity_id: "patient-john",
+            thread_id: "session-4",
+            turn_index: 8,
+            metadata: { role: "patient" },
+          },
+        ],
+      }))
+      .mockResolvedValueOnce(retrieveResponse([
+        { doc_id: "recent-2", score: 97, content: "duplicate semantic turn" },
+        { doc_id: "older-match", score: 82, content: "Earlier grounding exercise" },
+      ]))
+      .mockResolvedValueOnce(binaryResponse("How did the exercise go?"))
+      .mockResolvedValueOnce(binaryResponse("It helped before sleep."));
+
+    const thread = new Thread(newMemory(), "session-4");
+    const items = await thread.context("what helped with sleep?", 2, true);
+
+    expect(items.map((item) => item.id)).toEqual([
+      "recent-1",
+      "recent-2",
+      "older-match",
+    ]);
+    expect(items.map((item) => item.text)).toEqual([
+      "How did the exercise go?",
+      "It helped before sleep.",
+      "Earlier grounding exercise",
+    ]);
+    expect(items[2].score).toBeCloseTo(0.82);
+    expect(call(0).url).toContain("last_n_turns=2");
+    expect(call(0).url).toContain("recent_first=true");
+    expect(call(1).url).toContain("thread_id=session-4");
+    expect(call(1).url).toContain("entity_id=patient-john");
+    expect(call(1).url).toContain("k=5");
+  });
+
+  it("retries a committed turn while its origin projection is pending", async () => {
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse({
+        thread_id: "session-4",
+        documents: [{
+          doc_id: "pending-1",
+          cid: "",
+          content_type: "text/plain",
+          size_bytes: 14,
+          chunks: 0,
+          vectors: 0,
+          version: 1,
+          entity_id: "patient-john",
+          thread_id: "session-4",
+          turn_index: 0,
+        }],
+      }))
+      .mockResolvedValueOnce(retrieveResponse([]))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: "Thread turn is committed but its origin projection is still pending",
+        code: "thread_projection_pending",
+      }), {
+        status: 503,
+        headers: { "Content-Type": "application/json", "Retry-After": "0" },
+      }))
+      .mockResolvedValueOnce(binaryResponse("projected turn"));
+    const client = new AetherClient({
+      baseUrl: "http://localhost:9000",
+      apiKey: "aether_testkey123",
+      maxRetries: 1,
+      retryBaseDelay: 0,
+    });
+
+    const items = await new Thread(
+      new Memory("patient-john", { client }),
+      "session-4",
+    ).context("history");
+
+    expect(items.map((item) => item.text)).toEqual(["projected turn"]);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(call(2).url).toContain("/documents/pending-1/download");
+    expect(call(3).url).toContain("/documents/pending-1/download");
+  });
+
+  it("bounds concurrent thread context downloads", async () => {
+    let activeDownloads = 0;
+    let peakDownloads = 0;
+    mockFetch.mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/threads/session-4")) {
+        return jsonResponse({
+          thread_id: "session-4",
+          documents: Array.from({ length: 17 }, (_, index) => ({
+            doc_id: `turn-${index}`,
+            entity_id: "patient-john",
+            thread_id: "session-4",
+            turn_index: index,
+          })),
+        });
+      }
+      if (url.includes("/search")) return retrieveResponse([]);
+      if (url.includes("/download")) {
+        activeDownloads += 1;
+        peakDownloads = Math.max(peakDownloads, activeDownloads);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        activeDownloads -= 1;
+        return binaryResponse("turn text");
+      }
+      throw new Error(`unexpected URL ${url}`);
+    });
+
+    const items = await new Thread(newMemory(), "session-4").context("history", 17);
+
+    expect(items).toHaveLength(17);
+    expect(peakDownloads).toBe(8);
+  });
+
+  it("stops before the next batch when the context byte budget is exceeded", async () => {
+    const largeTurn = "x".repeat(2 * 1024 * 1024 + 1);
+    let downloadCalls = 0;
+    mockFetch.mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/threads/session-4")) {
+        return jsonResponse({
+          thread_id: "session-4",
+          documents: Array.from({ length: 9 }, (_, index) => ({
+            doc_id: `turn-${index}`,
+            entity_id: "patient-john",
+            thread_id: "session-4",
+            turn_index: index,
+          })),
+        });
+      }
+      if (url.includes("/search")) return retrieveResponse([]);
+      if (url.includes("/download")) {
+        downloadCalls += 1;
+        return binaryResponse(largeTurn);
+      }
+      throw new Error(`unexpected URL ${url}`);
+    });
+
+    await expect(
+      new Thread(newMemory(), "session-4").context("history", 9),
+    ).rejects.toThrow(/byte safety limit/);
+
+    expect(downloadCalls).toBe(8);
+    expect(mockFetch.mock.calls.some(([url]) =>
+      String(url).includes("/documents/turn-8/download")
+    )).toBe(false);
+  });
+
+  it("validates helper inputs before any HTTP call", async () => {
+    const memory = newMemory();
+    expect(() => new Thread(memory, " ")).toThrow(AetherError);
+    const thread = memory.thread("session-4");
+    expect(() => memory.thread("safe\u0000id")).toThrow(/control/);
+    expect(() => new Thread(memory, "safe\uD800")).toThrow(/surrogate/);
+    expect(() => memory.thread("\uDC00safe")).toThrow(/surrogate/);
+    expect(() => memory.thread("😀".repeat(256))).not.toThrow();
+    expect(() => memory.thread("😀".repeat(257))).toThrow(/256/);
+    await expect(thread.append(" ")).rejects.toThrow(AetherError);
+    await expect(thread.context(" ")).rejects.toThrow(AetherError);
+    await expect(thread.context("query", 0)).rejects.toThrow(AetherError);
+    await expect(thread.context("query", 1001)).rejects.toThrow(AetherError);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });
 

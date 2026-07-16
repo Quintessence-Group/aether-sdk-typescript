@@ -89,6 +89,21 @@ export class PartitionRequiredError extends AetherApiError {
 }
 
 /**
+ * Thrown when an API key that is pinned to an acting principal receives a
+ * request asserting a *different* principal (HTTP 403,
+ * `code: "principal_pin_mismatch"`). A pinned key always acts as exactly its
+ * pinned principal: issue the call without `asPrincipal(...)` (or with the
+ * matching principal), or use an unpinned key. Not retryable: it is a
+ * programming error, not a transient failure.
+ */
+export class PrincipalPinMismatchError extends AetherApiError {
+  constructor(status: number, statusText: string, body: AetherErrorBody) {
+    super(status, statusText, body);
+    this.name = "PrincipalPinMismatchError";
+  }
+}
+
+/**
  * Build the most-specific `AetherApiError` subclass for the given response.
  * The factory inspects the structured `code` field (Phase 8 / ADR-015 wire
  * shape); unknown codes fall back to the base `AetherApiError`.
@@ -106,6 +121,9 @@ export function aetherApiErrorFromResponse(
   }
   if (status === 403 && body.code === "tenant_paused") {
     return new TenantPausedError(status, statusText, body);
+  }
+  if (status === 403 && body.code === "principal_pin_mismatch") {
+    return new PrincipalPinMismatchError(status, statusText, body);
   }
   if (status === 400 && body.code === "partition_required") {
     return new PartitionRequiredError(status, statusText, body);

@@ -94,6 +94,38 @@ for (const r of results) {
 }
 ```
 
+## Per-user permissions & audit
+
+Restrict who can read a document, then scope a client to act on behalf of a
+principal so reads are filtered by each document's ACL:
+
+```typescript
+import { AetherClient, PrincipalPinMismatchError } from "@aether-ai/sdk";
+
+const client = new AetherClient({ apiKey: "aether_your_key_here" });
+
+// Write with a read-ACL — only alice and the eng group can read this document.
+// Omit aclReaders (or pass []) for the admin-only default.
+await client.insertText("Q3 board deck notes", {
+  aclReaders: ["user:alice", "group:eng"],
+});
+
+// Act as a principal: searches and reads only surface documents this principal
+// is allowed to see. Composes with client.partition(...).
+const alice = client.asPrincipal("user:alice", { groups: ["group:eng"] });
+const hits = await alice.search("board deck", 5);
+
+// Query the tenant's access-audit log (requires audit capture to be enabled).
+const page = await client.audit.access({ action: "read", limit: 100 });
+console.log(`${page.total} read events`);
+for (const rec of page.records) {
+  console.log(rec.at, rec.actor, rec.action, rec.resource);
+}
+```
+
+A principal-pinned API key that is asked to assert a different principal throws
+`PrincipalPinMismatchError`.
+
 ## Supported File Formats
 
 Content type is auto-detected from the filename extension. No need to specify `contentType` manually.
