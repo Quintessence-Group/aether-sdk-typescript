@@ -18,7 +18,7 @@ export interface DocumentRecord {
   title?: string;
   /** Entity this document belongs to (e.g. a user or customer id), if any. */
   entity_id?: string;
-  /** Conversation identity when this document is an AET-151 thread turn. */
+  /** Conversation identity when this document is a thread turn. */
   thread_id?: string | null;
   /** Zero-based, server-assigned position within `thread_id`. */
   turn_index?: number | null;
@@ -573,7 +573,7 @@ export interface ShareableReceipt {
   badge_url: string;
 }
 
-/** Authenticated AET-348 response binding one answer to its declared sources. */
+/** Authenticated response binding one answer to its declared sources. */
 export interface GroundingReceipt {
   answer_digest: string;
   sources: GroundingSource[];
