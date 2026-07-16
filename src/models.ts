@@ -18,6 +18,10 @@ export interface DocumentRecord {
   title?: string;
   /** Entity this document belongs to (e.g. a user or customer id), if any. */
   entity_id?: string;
+  /** Conversation identity when this document is a thread turn. */
+  thread_id?: string | null;
+  /** Zero-based, server-assigned position within `thread_id`. */
+  turn_index?: number | null;
   content_type: string;
   size_bytes: number;
   chunks: number;
@@ -40,6 +44,23 @@ export interface DocumentRecord {
    * `entity_id`/`source` convention.
    */
   partition: string | null;
+  /** `image` or `audio` for a multimodal memory. */
+  modality?: "image" | "audio";
+  /** Indexed caption/transcript for a multimodal memory. */
+  derived_text?: string;
+}
+
+export interface MediaMemoryRecord {
+  doc_id: string;
+  cid: string;
+  modality: "image" | "audio";
+  content_type: string;
+  derived_text: string;
+  derived_by: string;
+  created_at?: string;
+  entity_id?: string;
+  partition: string | null;
+  metadata: Metadata;
 }
 
 export interface SearchResult {
@@ -52,6 +73,10 @@ export interface SearchResult {
   title?: string;
   /** Entity the matched document belongs to (e.g. a user or customer id), if any. */
   entity_id?: string;
+  /** Conversation identity when this hit is a thread turn. */
+  thread_id?: string | null;
+  /** Zero-based, server-assigned position within `thread_id`. */
+  turn_index?: number | null;
   content_type: string;
   content?: string;
   /** The specific passage that matched the query vector, if available. */
@@ -85,6 +110,8 @@ export interface SearchResult {
    * `get` round-trip.
    */
   updated_at?: string | null;
+  /** `image` or `audio` when this hit is a multimodal memory. */
+  modality?: "image" | "audio";
   /**
    * Feedback handle for the search that returned this hit. Present only when
    * usage-feedback capture is enabled for your tenant (`undefined` otherwise);
@@ -92,6 +119,37 @@ export interface SearchResult {
    * hit's `doc_id`.
    */
   queryId?: string;
+}
+
+/** Input for {@link AetherClient.appendThread}. */
+export interface ThreadAppendInput {
+  /** Non-empty turn text. */
+  text: string;
+  metadata?: Metadata;
+  tags?: string[];
+  entityId?: string;
+  source?: string;
+  aclReaders?: string[];
+  filename?: string;
+  /**
+   * Stable caller key for retry-safe append. Omit to let the SDK mint one
+   * stable key for this logical call and all of its transport retries.
+   */
+  idempotencyKey?: string;
+}
+
+/** Options for {@link AetherClient.getThread}. */
+export interface ThreadReadOptions {
+  /** Return 1-1000 newest turns, still in chronological order by default. */
+  lastNTurns?: number;
+  /** Return selected turns newest-first. Defaults to `false`. */
+  recentFirst?: boolean;
+}
+
+/** Canonical, tenant-scoped conversation returned by `GET /threads/{thread_id}`. */
+export interface ConversationThread {
+  thread_id: string;
+  documents: DocumentRecord[];
 }
 
 /**
@@ -128,6 +186,13 @@ export interface BatchInsertItem {
   source?: string;
   /** Structured metadata for filtering. Values must be strings, numbers, or booleans. */
   metadata?: Metadata;
+  /**
+   * Read-ACL for this document: `user:` / `group:` labels naming who may read
+   * it (sent comma-separated on the wire). Omit to leave it unlabeled /
+   * tenant-visible; an explicit empty array quarantines it to admin-role keys
+   * only. Mirrors the `aclReaders` insert option.
+   */
+  acl_readers?: string[];
 }
 
 export interface BatchSearchQuery {
@@ -147,6 +212,8 @@ export interface BatchSearchQuery {
   include_content?: boolean;
   /** Filter results to documents with this entity id. */
   entity_id?: string;
+  /** Restrict results to one canonical conversation thread. */
+  threadId?: string;
   /** Only match documents created at or after this RFC 3339 timestamp (inclusive). */
   since?: string;
   /** Only match documents created at or before this RFC 3339 timestamp (inclusive). */
@@ -343,25 +410,177 @@ export interface AuditProof {
 }
 
 /**
- * One entry in a document's signed provenance/lineage trail, returned by
- * {@link AetherClient.lineage}. Fields are the wire values verbatim
- * (snake_case), mirroring {@link DocumentRecord}.
+ * One audit record in the shared envelope used by both audit surfaces:
+ * the signed provenance/lineage trail returned by {@link AetherClient.lineage}
+ * (`source: "ledger"`, always carrying a cryptographic `proof`) and the
+ * access-audit log returned by `client.audit.access(...)` (`source: "access"`,
+ * no proof). Fields are the wire values verbatim (snake_case), mirroring
+ * {@link DocumentRecord}.
  */
 export interface AuditRecord {
   /** RFC 3339 timestamp of when the event occurred. */
   at: string;
-  /** Who performed the action (e.g. `"node:<hex>"`). */
+  /**
+   * Who performed the action. Ledger records name the signing node
+   * (`"node:<hex>"`); access records name the asserted acting principal
+   * (e.g. `"user:alice"`), or `"key:<prefix>"` when none was asserted.
+   */
   actor: string;
-  /** The action recorded (e.g. `"document.inserted"`). */
+  /**
+   * The action recorded (e.g. `"document.inserted"`; access records use
+   * `"read"` / `"search_hit"` / `"denied"` / `"admin_bypass"`).
+   */
   action: string;
   /** The resource the action was performed on (e.g. `"document:<uuid>"`). */
   resource: string;
-  /** The outcome of the action (e.g. `"committed"`). */
+  /**
+   * The outcome of the action (`"committed"` for ledger records; `"ok"` /
+   * `"denied"` / `"admin_bypass"` for access records).
+   */
   outcome: string;
-  /** Where the record was sourced from (e.g. `"ledger"`). */
+  /** Which audit surface produced the record: `"ledger"` or `"access"`. */
   source: string;
-  /** Cryptographic proof for this record. */
-  proof: AuditProof;
+  /**
+   * Cryptographic proof for this record. Present on ledger-sourced records;
+   * absent on access records (an operational log carries no proof).
+   */
+  proof?: AuditProof;
+}
+
+// ── Access audit ─────────────────────────────────────────────────────
+
+/**
+ * Filters for `client.audit.access(...)`. All optional; omitted → unfiltered.
+ * Filters compose with AND.
+ */
+export interface AccessAuditQuery {
+  /**
+   * Only events by this actor — an asserted acting principal (e.g.
+   * `"user:alice"`), or `"key:<prefix>"` for requests that asserted none.
+   */
+  actor?: string;
+  /**
+   * Only events on this resource (a document id, or a query id for
+   * `search_hit` events).
+   */
+  resource?: string;
+  /** Only this action: `"read"` | `"search_hit"` | `"denied"` | `"admin_bypass"`. */
+  action?: string;
+  /** Inclusive lower time bound (RFC 3339). */
+  since?: string;
+  /** Inclusive upper time bound (RFC 3339). */
+  until?: string;
+  /** Page size (server default 100, max 1000). */
+  limit?: number;
+  /** Page offset. */
+  offset?: number;
+}
+
+/** A page of access-audit records returned by `client.audit.access(...)`. */
+export interface AccessAuditPage {
+  /**
+   * The matching access events, newest first, in the shared {@link AuditRecord}
+   * envelope with `source: "access"` and no `proof`.
+   */
+  records: AuditRecord[];
+  /** Total events matching the filter across all pages (ignores pagination). */
+  total: number;
+}
+
+/** The `client.audit` facade — query the tenant's access-audit log. */
+export interface AuditOps {
+  access(query?: AccessAuditQuery): Promise<AccessAuditPage>;
+}
+
+/** One tenant-private source in an answer's declared grounding set. This type
+ * is returned only by the authenticated receipt-creation call. */
+export interface GroundingSource {
+  document_id: string;
+  content_id: string;
+  rank: number;
+  retained_signed_event_count: number;
+  current_content_verified: boolean;
+  /** Existing engine-verified lineage evidence for the CID; not a standalone
+   * LedgerEvent signing transcript. */
+  proof?: AuditProof;
+}
+
+/**
+ * Integrity state for an answer's declared grounding set. `verified` means
+ * retained signed source evidence was valid when the receipt was created. It
+ * does not rate factual correctness or prove an external model's reasoning.
+ */
+export interface GroundingTrustSignal {
+  status: string;
+  sources_requested: number;
+  sources_verified: number;
+  answer_bound: boolean;
+}
+
+/**
+ * Authenticated-only verification material for the opaque public binding.
+ * `verification_salt` is never stored or emitted from a public receipt URL;
+ * retain it with your answer/source result if you need to recompute the binding.
+ */
+export interface GroundingBinding {
+  algorithm: string;
+  source_set_commitment: string;
+  source_evidence_commitment: string;
+  binding_commitment: string;
+  verification_salt: string;
+}
+
+/** Ed25519 node attestation over a public-safe receipt payload. */
+export interface ReceiptAttestation {
+  signer_node_id: string;
+  signer_public_key: string;
+  signature: string;
+  verified: boolean;
+}
+
+/** Ed25519 attestation over every authenticated grounding result. */
+export interface GroundingSetAttestation {
+  version: string;
+  issued_at: string;
+  binding_algorithm: string;
+  signer_node_id: string;
+  signer_public_key: string;
+  signature: string;
+  verified: boolean;
+}
+
+/**
+ * Aggregate-only share metadata returned after an explicit `share: true` opt
+ * in. Its public URL never exposes answer text/digest, tenant id, document ids,
+ * CIDs, titles, passages, or raw ledger events.
+ */
+export interface ShareableReceipt {
+  version: string;
+  receipt_id: string;
+  issued_at: string;
+  expires_at: string;
+  source_count: number;
+  verified_source_count: number;
+  status: string;
+  /** Opaque keyed commitment; it contains no raw answer or answer digest. */
+  binding_commitment: string;
+  /** Signed BLAKE3 commitment to the decoded 256-bit public capability. */
+  capability_commitment: string;
+  /** Opaque signed owner binding; it cannot be recomputed from public data. */
+  owner_commitment: string;
+  attestation: ReceiptAttestation;
+  share_url: string;
+  badge_url: string;
+}
+
+/** Authenticated response binding one answer to its declared sources. */
+export interface GroundingReceipt {
+  answer_digest: string;
+  sources: GroundingSource[];
+  trust: GroundingTrustSignal;
+  binding: GroundingBinding;
+  attestation: GroundingSetAttestation;
+  receipt?: ShareableReceipt;
 }
 
 // ── Structured query & field schema ─────────────────────────────────

@@ -7,16 +7,21 @@ import {
   aetherApiErrorFromResponse,
 } from "./errors.js";
 import type {
+  AccessAuditPage,
+  AccessAuditQuery,
   AggregateResult,
+  AuditOps,
   AuditRecord,
   BatchInsertItem,
   BatchSearchQuery,
   BatchSearchResponse,
   ChunkingConfig,
+  ConversationThread,
   DocumentRecord,
   EntityBackfillReport,
   FieldSchema,
   FieldSchemaInput,
+  GroundingReceipt,
   QueryGroup,
   QueryPage,
   SchemaOps,
@@ -24,6 +29,7 @@ import type {
   IsolationCheck,
   Metadata,
   MetadataFilter,
+  MediaMemoryRecord,
   NodeStatus,
   PartitionInfo,
   PartitionList,
@@ -32,6 +38,8 @@ import type {
   SearchFeedbackSignal,
   SearchResult,
   SearchTrace,
+  ThreadAppendInput,
+  ThreadReadOptions,
   TracedSearch,
 } from "./models.js";
 /**
@@ -65,6 +73,21 @@ function userAgent(): string | undefined {
     return `aether-sdk-typescript/${SDK_VERSION} (node/${process.versions.node})`;
   }
   return undefined;
+}
+
+/** Standard base64 in both Node 18+ and modern browsers. */
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString(
+      "base64",
+    );
+  }
+  let binary = "";
+  const chunk = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+  }
+  return btoa(binary);
 }
 
 /** RFC 4122 v4 UUID, using Web Crypto when available with a safe fallback. */
@@ -181,6 +204,45 @@ export function resolveContentType(filePath: string): string | undefined {
 
 /** Maximum partition id length accepted by the server. */
 const MAX_PARTITION_LEN = 256;
+const MAX_THREAD_ID_LEN = 256;
+const MAX_THREAD_READ_TURNS = 1_000;
+
+/** @internal Shared raw/facade validator; intentionally not re-exported. */
+export function validateThreadId(threadId: string): void {
+  if (!threadId || threadId.trim().length === 0) {
+    throw new AetherError("threadId is required");
+  }
+  if (threadId === "." || threadId === "..") {
+    throw new AetherError("threadId must not be a reserved URL dot segment");
+  }
+  if (/[\u0000-\u001F\u007F-\u009F]/u.test(threadId)) {
+    throw new AetherError("threadId must not contain control characters");
+  }
+  // Count Unicode scalar values while rejecting malformed UTF-16 explicitly.
+  // String iteration would otherwise treat an unpaired surrogate as a value,
+  // only for encodeURIComponent to fail later with an unrelated URIError.
+  let scalarCount = 0;
+  for (let index = 0; index < threadId.length; index += 1) {
+    const codeUnit = threadId.charCodeAt(index);
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      const nextCodeUnit = threadId.charCodeAt(index + 1);
+      if (
+        index + 1 >= threadId.length
+        || nextCodeUnit < 0xDC00
+        || nextCodeUnit > 0xDFFF
+      ) {
+        throw new AetherError("threadId must not contain unpaired surrogates");
+      }
+      index += 1;
+    } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+      throw new AetherError("threadId must not contain unpaired surrogates");
+    }
+    scalarCount += 1;
+  }
+  if (scalarCount > MAX_THREAD_ID_LEN) {
+    throw new AetherError(`threadId must be at most ${MAX_THREAD_ID_LEN} characters`);
+  }
+}
 
 /**
  * Strip trailing slashes from a base URL. A single reverse scan is used rather
@@ -226,6 +288,15 @@ export class AetherClient {
    * so a scope can never be forgotten or overridden per call.
    */
   private readonly partitionId?: string;
+  /**
+   * The acting principal every request on this instance asserts, or
+   * `undefined` for the default (unasserted) client. Immutable, set only by
+   * {@link asPrincipal}. Never a method parameter — it is read off the
+   * instance so an assertion can never be forgotten or overridden per call.
+   */
+  private readonly actingPrincipal?: string;
+  /** Groups the acting principal asserts alongside {@link actingPrincipal}. */
+  private readonly actingGroups?: string[];
 
   constructor(options: AetherClientOptions = {}) {
     this.baseUrl = stripTrailingSlashes(
@@ -307,6 +378,84 @@ export class AetherClient {
     if (this.partitionId) {
       params.set("partition", this.partitionId);
     }
+  }
+
+  // ── Acting-principal scoping ──────────────────────────────────────
+
+  /**
+   * Return a clone of this client scoped to an acting principal.
+   *
+   * Every request on the returned handle asserts that it is made on behalf of
+   * `principal` (e.g. `"user:alice"`), optionally acting with `options.groups`
+   * (e.g. `["group:eng"]`), by carrying `acting_principal` / `acting_groups`
+   * on the wire. Reads through the handle are then filtered by each document's
+   * read-ACL (`aclReaders`): the principal sees unlabeled documents plus those
+   * whose ACL names it (or one of its groups), and a document it cannot read
+   * is indistinguishable from a missing one. Admin-role keys bypass read-ACL
+   * filtering. The assertion also becomes the `actor` recorded in the
+   * access-audit log.
+   *
+   * The scope mirrors {@link partition} and composes with it —
+   * `client.partition("p").asPrincipal("user:alice")` carries both. The clone
+   * shares this client's transport and all configuration; there is nothing to
+   * dispose. Re-scoping is last-wins:
+   * `client.asPrincipal("user:a").asPrincipal("user:b")` asserts `"user:b"`.
+   *
+   * Under an API key that is *pinned* to a principal, a handle asserting the
+   * same principal is allowed; asserting a different one fails every call with
+   * a `PrincipalPinMismatchError` (the pin can never be widened or overridden
+   * per request).
+   *
+   * @param principal - The acting principal to assert (e.g. `"user:alice"`);
+   *   non-empty / non-whitespace.
+   * @param options - Scope options.
+   * @param options.groups - Groups the principal acts with (e.g.
+   *   `["group:eng"]`); blank entries are dropped.
+   * @returns A scoped clone of this client sharing the same transport and config.
+   * @throws {AetherError} If `principal` is empty or whitespace (client-side —
+   *   never a network round-trip).
+   */
+  asPrincipal(principal: string, options?: { groups?: string[] }): AetherClient {
+    if (!principal || principal.trim().length === 0) {
+      throw new AetherError("principal is required");
+    }
+    // Groups travel comma-joined on the wire, so a comma inside one label
+    // would silently split it into several — widening the asserted read scope.
+    for (const g of options?.groups ?? []) {
+      if (g.includes(",")) {
+        throw new AetherError(
+          `group label cannot contain a comma: ${JSON.stringify(g)}`,
+        );
+      }
+    }
+    const actingGroups = (options?.groups ?? [])
+      .map((g) => g.trim())
+      .filter((g) => g.length > 0);
+    return Object.assign(
+      Object.create(AetherClient.prototype) as AetherClient,
+      this,
+      { actingPrincipal: principal.trim(), actingGroups },
+    );
+  }
+
+  /**
+   * Append this handle's acting-principal assertion to a request path. A
+   * no-op on an unscoped client, which keeps pre-handle behavior
+   * byte-identical. Applied at the transport boundary so every call issued
+   * through an {@link asPrincipal} handle carries the assertion.
+   */
+  private withPrincipal(path: string): string {
+    if (!this.actingPrincipal) return path;
+    const params = new URLSearchParams();
+    params.set("acting_principal", this.actingPrincipal);
+    if (this.actingGroups && this.actingGroups.length > 0) {
+      params.set("acting_groups", this.actingGroups.join(","));
+    }
+    return `${path}${path.includes("?") ? "&" : "?"}${params}`;
+  }
+
+  private static validateThreadId(threadId: string): void {
+    validateThreadId(threadId);
   }
 
   /**
@@ -392,6 +541,56 @@ export class AetherClient {
   }
 
   /**
+   * Validate read-ACL reader labels client-side (never a network round-trip).
+   * Labels are opaque, but two shapes are rejected loudly because the wire
+   * encoding would silently change their meaning: a label containing a comma
+   * (the document routes are comma-joined, so one label would become several —
+   * widening the ACL), and an empty/blank label (the server drops blanks, so
+   * `[""]` would silently collapse into the admin-only quarantine state).
+   */
+  private static validateAclReaders(aclReaders: string[]): string[] {
+    for (const label of aclReaders) {
+      if (!label || label.trim().length === 0) {
+        throw new AetherError(
+          "aclReaders labels cannot be empty; pass [] for the admin-only " +
+            "quarantine state or omit the option to leave the document unlabeled",
+        );
+      }
+      if (label.includes(",")) {
+        throw new AetherError(
+          `aclReaders label cannot contain a comma: ${JSON.stringify(label)}`,
+        );
+      }
+    }
+    return aclReaders;
+  }
+
+  /**
+   * Comma-join a validated read-ACL for the wire (`[]` survives as the empty
+   * string — the explicit admin-only quarantine state).
+   */
+  private static aclReadersCsv(aclReaders: string[]): string {
+    return AetherClient.validateAclReaders(aclReaders).join(",");
+  }
+
+  /**
+   * Add the `acl_readers` write param when the caller supplied a read-ACL.
+   * The three states are distinct and all meaningful: `undefined` → omit the
+   * param (the document stays unlabeled / tenant-visible); `[]` → an explicit
+   * empty value (the document is quarantined to admin-role keys only);
+   * `["user:a", "group:b"]` → readable by those labels (comma-joined on the
+   * wire, like `tags`).
+   */
+  private static setAclReadersParam(
+    params: URLSearchParams,
+    aclReaders: string[] | undefined,
+  ): void {
+    if (aclReaders !== undefined) {
+      params.set("acl_readers", AetherClient.aclReadersCsv(aclReaders));
+    }
+  }
+
+  /**
    * Encode an array filter as a comma-separated string on a wire object, in
    * place: sets `obj[key]` to the joined value when the array is non-empty,
    * otherwise removes the key so empty filters drop out of the request. Mirrors
@@ -457,22 +656,20 @@ export class AetherClient {
 
       // If we have retries left, wait with exponential backoff
       if (attempt < maxAttempts - 1) {
-        let delayMs: number;
+        const backoffMs = this.retryBaseDelay * 2 ** attempt * 1000;
+        let delayMs = backoffMs;
 
-        // Respect Retry-After header on 429 responses
-        if (response?.status === 429) {
+        // Respect Retry-After on every retryable HTTP response. This includes
+        // a 503 from a thread origin while a committed turn's local projection
+        // is still catching up for Thread.context downloads.
+        if (response != null) {
           const retryAfter = response.headers.get("Retry-After");
           if (retryAfter != null) {
             const parsed = Number(retryAfter);
-            delayMs = Number.isNaN(parsed)
-              ? // Retry-After may be an HTTP-date; fall back to default backoff
-                this.retryBaseDelay * 2 ** attempt * 1000
-              : parsed * 1000;
-          } else {
-            delayMs = this.retryBaseDelay * 2 ** attempt * 1000;
+            if (!Number.isNaN(parsed)) {
+              delayMs = Math.max(backoffMs, parsed * 1000);
+            }
           }
-        } else {
-          delayMs = this.retryBaseDelay * 2 ** attempt * 1000;
         }
 
         // Add jitter: random 0-50% of the computed delay
@@ -490,8 +687,10 @@ export class AetherClient {
   ): Promise<T> {
     // Data routes are rewritten under the /v1 API version prefix here, at the
     // transport boundary, so every caller (including the Memory facade)
-    // versions its paths in one place.
-    const url = `${this.baseUrl}${versionedPath(path)}`;
+    // versions its paths in one place. An asPrincipal() handle's assertion
+    // params are injected here for the same reason — every route through the
+    // handle carries them.
+    const url = `${this.baseUrl}${versionedPath(this.withPrincipal(path))}`;
     const response = await this.requestWithRetry(url, init ?? {});
 
     if (!response.ok) {
@@ -511,7 +710,7 @@ export class AetherClient {
     path: string,
     init?: RequestInit,
   ): Promise<ArrayBuffer> {
-    const url = `${this.baseUrl}${versionedPath(path)}`;
+    const url = `${this.baseUrl}${versionedPath(this.withPrincipal(path))}`;
     const response = await this.requestWithRetry(url, init ?? {});
 
     if (!response.ok) {
@@ -532,7 +731,7 @@ export class AetherClient {
     path: string,
     init: RequestInit,
   ): Promise<T> {
-    const url = `${this.baseUrl}${versionedPath(path)}`;
+    const url = `${this.baseUrl}${versionedPath(this.withPrincipal(path))}`;
     const baseHeaders: Record<string, string> = { ...this.headers };
     if ((init.method ?? "GET").toUpperCase() === "POST") {
       baseHeaders["Idempotency-Key"] = randomUUID();
@@ -587,6 +786,11 @@ export class AetherClient {
    * @param options.metadata - Structured metadata for filtering.
    * @param options.entityId - Entity this document belongs to (e.g. a user or customer id), for filtering.
    * @param options.source - Origin/source of this document (e.g. `"slack"`, `"notion"`), for filtering.
+   * @param options.aclReaders - Read-ACL for the document: `user:` / `group:` labels
+   *   (e.g. `["user:alice", "group:eng"]`) naming who may read it, enforced against
+   *   the acting principal asserted via {@link asPrincipal} (admin-role keys bypass).
+   *   Omit to leave the document unlabeled — readable tenant-wide, the default. An
+   *   explicit empty array quarantines the document to admin-role keys only.
    * @param options.chunking - Chunking configuration for document splitting.
    * @returns The created document record.
    * @throws {AetherError} If filename is empty or chunking config is invalid.
@@ -602,6 +806,7 @@ export class AetherClient {
       metadata?: Metadata;
       entityId?: string;
       source?: string;
+      aclReaders?: string[];
       chunking?: ChunkingConfig;
     },
   ): Promise<DocumentRecord> {
@@ -627,6 +832,7 @@ export class AetherClient {
       params.set("source", options.source);
     }
     AetherClient.setJsonParam(params, "metadata", options.metadata);
+    AetherClient.setAclReadersParam(params, options.aclReaders);
     this.applyPartitionParam(params);
     if (options.chunking?.chunkSize) {
       params.set("chunk_size", options.chunking.chunkSize.toString());
@@ -639,6 +845,69 @@ export class AetherClient {
       body: data as unknown as BodyInit,
     });
     return AetherClient.normalizeDocument(record);
+  }
+
+  // ── Conversational threads ───────────────────────────────────────
+
+  /**
+   * Append one turn to a tenant-scoped conversation. The server allocates the
+   * unique zero-based `turn_index` through its shared control plane; callers
+   * must never calculate it locally. The SDK's normal POST retry transport
+   * supplies one stable `Idempotency-Key` when `idempotencyKey` is omitted.
+   */
+  async appendThread(threadId: string, input: ThreadAppendInput): Promise<DocumentRecord> {
+    AetherClient.validateThreadId(threadId);
+    if (!input.text || input.text.trim().length === 0) {
+      throw new AetherError("text is required");
+    }
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const body = {
+      text: input.text,
+      metadata: input.metadata,
+      tags: input.tags,
+      entity_id: input.entityId,
+      source: input.source,
+      acl_readers: input.aclReaders,
+      filename: input.filename,
+    };
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (input.idempotencyKey) headers["Idempotency-Key"] = input.idempotencyKey;
+    const suffix = params.toString();
+    const record = await this._request<DocumentRecord>(
+      `/threads/${encodeURIComponent(threadId)}/append${suffix ? `?${suffix}` : ""}`,
+      { method: "POST", headers, body: JSON.stringify(body) },
+    );
+    return AetherClient.normalizeDocument(record);
+  }
+
+  /**
+   * Read the canonical shared conversation in turn order. A partition-scoped
+   * handle automatically includes the same hard partition boundary used by
+   * document/search calls.
+   */
+  async getThread(threadId: string, options: ThreadReadOptions = {}): Promise<ConversationThread> {
+    AetherClient.validateThreadId(threadId);
+    if (
+      options.lastNTurns !== undefined
+      && (!Number.isInteger(options.lastNTurns)
+        || options.lastNTurns < 1
+        || options.lastNTurns > MAX_THREAD_READ_TURNS)
+    ) {
+      throw new AetherError(`lastNTurns must be an integer between 1 and ${MAX_THREAD_READ_TURNS}`);
+    }
+    const params = new URLSearchParams();
+    if (options.lastNTurns !== undefined) params.set("last_n_turns", String(options.lastNTurns));
+    if (options.recentFirst) params.set("recent_first", "true");
+    this.applyPartitionParam(params);
+    const suffix = params.toString();
+    const thread = await this._request<ConversationThread>(
+      `/threads/${encodeURIComponent(threadId)}${suffix ? `?${suffix}` : ""}`,
+    );
+    return {
+      thread_id: thread.thread_id,
+      documents: (thread.documents ?? []).map(AetherClient.normalizeDocument),
+    };
   }
 
   // ── Batch / directory ingestion ───────────────────────────────────
@@ -676,6 +945,8 @@ export class AetherClient {
    * @param options.chunking - Chunking configuration applied to every file.
    * @param options.entityId - Entity id applied to every file.
    * @param options.source - Origin/source applied to every file.
+   * @param options.aclReaders - Read-ACL applied to every file (see
+   *   {@link insert} for the semantics).
    * @param options.raiseOnError - When `true`, re-throw on the first failure
    *   instead of collecting it as a result. Defaults to `false`.
    * @returns One {@link IngestResult} per input path, in order.
@@ -690,6 +961,7 @@ export class AetherClient {
       chunking?: ChunkingConfig;
       entityId?: string;
       source?: string;
+      aclReaders?: string[];
       raiseOnError?: boolean;
     },
   ): Promise<IngestResult[]> {
@@ -717,6 +989,7 @@ export class AetherClient {
           metadata: options?.metadata,
           entityId: options?.entityId,
           source: options?.source,
+          aclReaders: options?.aclReaders,
           chunking: options?.chunking,
         });
         results.push({
@@ -763,6 +1036,8 @@ export class AetherClient {
    * @param options.chunking - Chunking configuration applied to every file.
    * @param options.entityId - Entity id applied to every file.
    * @param options.source - Origin/source applied to every file.
+   * @param options.aclReaders - Read-ACL applied to every file (see
+   *   {@link insert} for the semantics).
    * @param options.raiseOnError - Re-throw on the first failure. Defaults to `false`.
    * @returns One {@link IngestResult} per matched file, sorted by path.
    * @throws {AetherError} If `dir` is not a directory.
@@ -777,6 +1052,7 @@ export class AetherClient {
       chunking?: ChunkingConfig;
       entityId?: string;
       source?: string;
+      aclReaders?: string[];
       raiseOnError?: boolean;
     },
   ): Promise<IngestResult[]> {
@@ -821,6 +1097,7 @@ export class AetherClient {
       chunking: options?.chunking,
       entityId: options?.entityId,
       source: options?.source,
+      aclReaders: options?.aclReaders,
       raiseOnError: options?.raiseOnError,
     });
   }
@@ -838,6 +1115,8 @@ export class AetherClient {
    * @param options.metadata - Structured metadata for filtering.
    * @param options.entityId - Entity this document belongs to (e.g. a user or customer id), for filtering.
    * @param options.source - Origin/source of this document (e.g. `"slack"`, `"notion"`), for filtering.
+   * @param options.aclReaders - Read-ACL for the document (see {@link insert}
+   *   for the semantics).
    * @returns The created document record.
    * @throws {AetherApiError} On non-2xx API response.
    * @throws {AetherNetworkError} On connection or timeout failure.
@@ -851,6 +1130,7 @@ export class AetherClient {
       metadata?: Metadata;
       entityId?: string;
       source?: string;
+      aclReaders?: string[];
     },
   ): Promise<DocumentRecord> {
     const filename = options?.filename ?? "upload.bin";
@@ -869,6 +1149,7 @@ export class AetherClient {
       params.set("source", options.source);
     }
     AetherClient.setJsonParam(params, "metadata", options?.metadata);
+    AetherClient.setAclReadersParam(params, options?.aclReaders);
     this.applyPartitionParam(params);
     const record = await this._requestNoRetry<DocumentRecord>(`/documents?${params}`, {
       method: "POST",
@@ -890,6 +1171,8 @@ export class AetherClient {
    * @param options.metadata - Structured metadata for filtering.
    * @param options.entityId - Entity this document belongs to (e.g. a user or customer id), for filtering.
    * @param options.source - Origin/source of this document (e.g. `"slack"`, `"notion"`), for filtering.
+   * @param options.aclReaders - Read-ACL for the document (see {@link insert}
+   *   for the semantics).
    * @param options.chunking - Chunking configuration for document splitting.
    * @returns The created document record.
    * @throws {AetherError} If text is empty or chunking config is invalid.
@@ -904,6 +1187,7 @@ export class AetherClient {
       metadata?: Metadata;
       entityId?: string;
       source?: string;
+      aclReaders?: string[];
       chunking?: ChunkingConfig;
       extractFacts?: boolean;
     },
@@ -933,6 +1217,7 @@ export class AetherClient {
     if (options?.extractFacts) {
       params.set("extract_facts", "true");
     }
+    AetherClient.setAclReadersParam(params, options?.aclReaders);
     this.applyPartitionParam(params);
     if (options?.chunking?.chunkSize) {
       params.set("chunk_size", options.chunking.chunkSize.toString());
@@ -945,6 +1230,75 @@ export class AetherClient {
       body: new TextEncoder().encode(text) as unknown as BodyInit,
     });
     return AetherClient.normalizeDocument(record);
+  }
+
+  /**
+   * Store validated image/audio bytes as a multimodal memory. The server keeps
+   * the original encrypted bytes and indexes either the supplied
+   * caption/transcript or its configured VLM/transcription output.
+   *
+   * Use {@link Memory.remember} for URL, Blob, ArrayBuffer, and local-path
+   * normalization; this raw method deliberately accepts bytes only.
+   */
+  async rememberMedia(
+    media: Uint8Array,
+    options: {
+      modality: "image" | "audio";
+      contentType: string;
+      entityId: string;
+      filename?: string;
+      caption?: string;
+      transcript?: string;
+      tags?: string[];
+      metadata?: Metadata;
+      source?: string;
+      readers?: string[];
+    },
+  ): Promise<MediaMemoryRecord> {
+    if (!(media instanceof Uint8Array) || media.byteLength === 0) {
+      throw new AetherError("media must be non-empty bytes");
+    }
+    if (!options.contentType?.trim()) {
+      throw new AetherError("contentType is required");
+    }
+    if (!options.entityId?.trim()) {
+      throw new AetherError("entityId is required");
+    }
+    if (options.modality === "image" && options.transcript !== undefined) {
+      throw new AetherError("transcript is valid only for audio memories");
+    }
+    if (options.modality === "audio" && options.caption !== undefined) {
+      throw new AetherError("caption is valid only for image memories");
+    }
+    const params = new URLSearchParams({ entity_id: options.entityId });
+    this.applyPartitionParam(params);
+    if (options.readers !== undefined) {
+      params.set("readers", options.readers.join(","));
+    }
+    const body: Record<string, unknown> = {
+      modality: options.modality,
+      data_base64: bytesToBase64(media),
+      content_type: options.contentType,
+      tags: options.tags ?? [],
+    };
+    if (options.filename) body.filename = options.filename;
+    if (options.caption !== undefined) body.caption = options.caption;
+    if (options.transcript !== undefined) body.transcript = options.transcript;
+    if (options.metadata !== undefined) body.metadata = options.metadata;
+    if (options.source) body.source = options.source;
+    const record = await this._request<MediaMemoryRecord>(
+      `/memory/media?${params}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    return {
+      ...record,
+      partition: record.partition ?? null,
+      metadata: record.metadata ?? {},
+    };
   }
 
   /**
@@ -966,6 +1320,10 @@ export class AetherClient {
    * @param options.metadata - Structured metadata for filtering (replaces existing structured metadata).
    * @param options.entityId - Entity this document belongs to (replaces the existing entity id; omitting it clears the binding).
    * @param options.source - Origin/source of this document (replaces the existing source; omitting it clears it).
+   * @param options.aclReaders - Read-ACL for the document (see {@link insert} for
+   *   the label format). Replaces the stored ACL: omitting it clears the ACL (the
+   *   document becomes unlabeled / tenant-visible), while an explicit empty array
+   *   quarantines the document to admin-role keys.
    * @param options.chunking - Chunking configuration for document splitting.
    * @returns The updated document record.
    * @throws {AetherError} If docId or filename is empty, or chunking config is invalid.
@@ -982,6 +1340,7 @@ export class AetherClient {
       metadata?: Metadata;
       entityId?: string;
       source?: string;
+      aclReaders?: string[];
       chunking?: ChunkingConfig;
     },
   ): Promise<DocumentRecord> {
@@ -1008,6 +1367,7 @@ export class AetherClient {
       params.set("source", options.source);
     }
     AetherClient.setJsonParam(params, "metadata", options.metadata);
+    AetherClient.setAclReadersParam(params, options.aclReaders);
     this.applyPartitionParam(params);
     if (options.chunking?.chunkSize) {
       params.set("chunk_size", options.chunking.chunkSize.toString());
@@ -1068,6 +1428,64 @@ export class AetherClient {
   }
 
   /**
+   * Bind an answer to the ordered document ids the application declared as its
+   * grounding sources. The server returns private source IDs/CIDs and a precise
+   * integrity signal; `verified` means retained signed source evidence was
+   * valid, not that the answer is factually correct or that a model reasoned
+   * from those sources.
+   *
+   * Set `share: true` to opt into a separate, revocable public-safe receipt and
+   * SVG badge. The returned share URL contains aggregate proof only. A shared
+   * receipt issuance is intentionally sent once: retrying a response-lost
+   * request could mint a second bearer capability.
+   */
+  async createGroundingReceipt(
+    answer: string,
+    sourceDocIds: string[],
+    options: { share?: boolean } = {},
+  ): Promise<GroundingReceipt> {
+    if (!answer.trim()) throw new AetherError("answer is required");
+    if (sourceDocIds.length === 0) {
+      throw new AetherError("sourceDocIds must not be empty");
+    }
+    const body: {
+      answer: string;
+      source_doc_ids: string[];
+      partition?: string;
+      share?: boolean;
+    } = {
+      answer,
+      source_doc_ids: sourceDocIds,
+    };
+    // Grounding is a body route, so the immutable partition handle injects its
+    // scope into the payload before any source lookup on the server.
+    if (this.partitionId) body.partition = this.partitionId;
+    if (options.share) body.share = true;
+    const init: RequestInit = {
+      method: "POST",
+      body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json" },
+    };
+    return options.share
+      ? this._requestNoRetry<GroundingReceipt>("/audit/grounding", init)
+      : this._request<GroundingReceipt>("/audit/grounding", init);
+  }
+
+  /**
+   * Revoke a public receipt owned by this tenant. Its share URL and SVG badge
+   * immediately return 404 afterward; unknown/foreign receipt IDs also 404.
+   */
+  async revokeGroundingReceipt(receiptId: string): Promise<void> {
+    if (!receiptId) throw new AetherError("receiptId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    await this._requestRaw(`/audit/receipts/${encodeURIComponent(receiptId)}${query ? `?${query}` : ""}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
    * Download the raw bytes of a document.
    *
    * On a partition handle the partition is sent as a guard: a doc id that
@@ -1120,6 +1538,7 @@ export class AetherClient {
    * @param options.sources - Filter results to documents from ANY of these sources (OR).
    * @param options.filter - Structured metadata filter with equality or operator predicates.
    * @param options.entityId - Filter results to documents with this entity id.
+   * @param options.threadId - Filter results to turns in one conversation.
    * @param options.since - Only match documents created at or after this RFC 3339 timestamp (inclusive), e.g. `"2026-06-01T00:00:00Z"`.
    * @param options.until - Only match documents created at or before this RFC 3339 timestamp (inclusive).
    * @param options.lastNDays - Only match documents created in the last N days. Cannot be combined with `since`.
@@ -1143,6 +1562,7 @@ export class AetherClient {
       sources?: string[];
       filter?: MetadataFilter;
       entityId?: string;
+      threadId?: string;
       since?: string;
       until?: string;
       lastNDays?: number;
@@ -1163,6 +1583,7 @@ export class AetherClient {
       sources: options?.sources,
       filter: options?.filter,
       entityId: options?.entityId,
+      threadId: options?.threadId,
       since: options?.since,
       until: options?.until,
       lastNDays: options?.lastNDays,
@@ -1183,23 +1604,46 @@ export class AetherClient {
 
     const unique = Array.from(seen.values());
 
-    // Use inline content if server provided it, otherwise download
-    const needsDownload = unique.filter((r) => r.content == null);
+    // Media downloads are the original binary asset. For media hits the
+    // matched passage is the indexed caption/transcript; if an older/search
+    // response omitted it, resolve derived_text via metadata GET instead.
+    const mediaNeedsGet = unique.filter(
+      (r) => r.modality && r.passage == null,
+    );
+    const mediaContentMap = new Map<string, string>();
+    if (mediaNeedsGet.length > 0) {
+      const records = await Promise.all(
+        mediaNeedsGet.map((r) => this.get(r.doc_id)),
+      );
+      mediaNeedsGet.forEach((r, i) => {
+        const derived = records[i].derived_text;
+        if (derived == null) {
+          throw new AetherError(`media result ${r.doc_id} has no derived_text`);
+        }
+        mediaContentMap.set(r.doc_id, derived);
+      });
+    }
+
+    // Only text hits without inline content need a binary download + UTF-8
+    // decode. Never put a media doc id in this list.
+    const needsDownload = unique.filter(
+      (r) => r.content == null && !r.modality,
+    );
+    const contentMap = new Map<string, string>();
     if (needsDownload.length > 0) {
       const downloaded = await Promise.all(
         needsDownload.map((r) => this.downloadText(r.doc_id)),
       );
-      const contentMap = new Map<string, string>();
       needsDownload.forEach((r, i) => contentMap.set(r.doc_id, downloaded[i]));
-      return unique.map((r) => ({
-        ...r,
-        content: r.content ?? contentMap.get(r.doc_id)!,
-      }));
     }
 
     return unique.map((r) => ({
       ...r,
-      content: r.content!,
+      content:
+        r.content ??
+        (r.modality
+          ? (r.passage ?? mediaContentMap.get(r.doc_id)!)
+          : contentMap.get(r.doc_id)!),
     }));
   }
 
@@ -1395,6 +1839,38 @@ export class AetherClient {
   }
 
   /**
+   * Access-audit facade — query the tenant's access-audit log (document reads,
+   * search deliveries, denials, and admin bypasses) via `audit.access(...)`.
+   *
+   * Requires access-audit capture to be enabled for your tenant (an operator
+   * setting); a tenant that has not opted in always gets an empty page. The
+   * returned records share the {@link AuditRecord} envelope with
+   * {@link lineage}, with `source: "access"` and no `proof`; `total` counts
+   * every event matching the filter (ignores `limit` / `offset`) for paging.
+   */
+  get audit(): AuditOps {
+    return {
+      access: async (query?: AccessAuditQuery): Promise<AccessAuditPage> => {
+        const params = new URLSearchParams();
+        if (query?.actor) params.set("actor", query.actor);
+        if (query?.resource) params.set("resource", query.resource);
+        if (query?.action) params.set("action", query.action);
+        if (query?.since) params.set("since", query.since);
+        if (query?.until) params.set("until", query.until);
+        if (query?.limit != null) params.set("limit", String(query.limit));
+        if (query?.offset != null) params.set("offset", String(query.offset));
+        const qs = params.toString();
+        const body = await this._request<{
+          records?: AuditRecord[];
+          total?: number;
+        }>(`/audit/access${qs ? `?${qs}` : ""}`);
+        const records = body.records ?? [];
+        return { records, total: body.total ?? records.length };
+      },
+    };
+  }
+
+  /**
    * Soft-delete (tombstone) a document.
    * The document is hidden from searches and listings but can be restored with {@link restore}.
    *
@@ -1531,6 +2007,7 @@ export class AetherClient {
    * @param options.sources - Filter results to documents from ANY of these sources (OR).
    * @param options.filter - Structured metadata filter with equality or operator predicates.
    * @param options.entityId - Filter results to documents with this entity id.
+   * @param options.threadId - Filter results to turns in one conversation.
    * @param options.since - Only match documents created at or after this RFC 3339 timestamp (inclusive), e.g. `"2026-06-01T00:00:00Z"`.
    * @param options.until - Only match documents created at or before this RFC 3339 timestamp (inclusive).
    * @param options.lastNDays - Only match documents created in the last N days. Cannot be combined with `since`.
@@ -1555,6 +2032,7 @@ export class AetherClient {
       sources?: string[];
       filter?: MetadataFilter;
       entityId?: string;
+      threadId?: string;
       since?: string;
       until?: string;
       lastNDays?: number;
@@ -1586,6 +2064,10 @@ export class AetherClient {
     AetherClient.setJsonParam(params, "filter", options?.filter);
     if (options?.entityId) {
       params.set("entity_id", options.entityId);
+    }
+    if (options?.threadId) {
+      AetherClient.validateThreadId(options.threadId);
+      params.set("thread_id", options.threadId);
     }
     this.applyPartitionParam(params);
     if (options?.since) {
@@ -1874,6 +2356,9 @@ export class AetherClient {
    * @param options.metadata - Structured metadata for filtering.
    * @param options.entityId - Entity this document belongs to (e.g. a user or customer id), for filtering.
    * @param options.source - Origin/source of this document (e.g. `"slack"`, `"notion"`), for filtering.
+   * @param options.aclReaders - Read-ACL for the document (see {@link insert}
+   *   for the semantics; this route sends it as a JSON array in the body
+   *   rather than a query param).
    * @returns The created document record.
    * @throws {AetherError} If content is empty, or neither passages nor embedding is provided.
    * @throws {AetherApiError} On non-2xx API response.
@@ -1889,6 +2374,7 @@ export class AetherClient {
     metadata?: Metadata;
     entityId?: string;
     source?: string;
+    aclReaders?: string[];
   }): Promise<DocumentRecord> {
     if (!options.content) throw new AetherError("content is required");
     if (!options.passages?.length && !options.embedding?.length) {
@@ -1904,6 +2390,12 @@ export class AetherClient {
       metadata: options.metadata,
       entity_id: options.entityId,
       source: options.source,
+      // JSON body route: the array survives verbatim (undefined drops out of
+      // JSON.stringify; [] is the explicit admin-only quarantine state).
+      acl_readers:
+        options.aclReaders !== undefined
+          ? AetherClient.validateAclReaders(options.aclReaders)
+          : undefined,
     };
     if (this.partitionId) {
       payload.partition = this.partitionId;
@@ -2015,6 +2507,8 @@ export class AetherClient {
    * @param options.metadata - Structured metadata for filtering.
    * @param options.entityId - Entity this document belongs to (e.g. a user or customer id), for filtering.
    * @param options.source - Origin/source of this document (e.g. `"slack"`, `"notion"`), for filtering.
+   * @param options.aclReaders - Read-ACL for the document (see {@link insert}
+   *   for the semantics).
    * @param options.chunking - Chunking configuration for document splitting.
    * @returns An object with the `job_id`, current `status`, and `poll_url` for tracking progress.
    * @throws {AetherError} If filename is empty or chunking config is invalid.
@@ -2030,6 +2524,7 @@ export class AetherClient {
       metadata?: Metadata;
       entityId?: string;
       source?: string;
+      aclReaders?: string[];
       chunking?: ChunkingConfig;
     },
   ): Promise<{ job_id: string; status: string; poll_url: string }> {
@@ -2054,6 +2549,7 @@ export class AetherClient {
       params.set("source", options.source);
     }
     AetherClient.setJsonParam(params, "metadata", options.metadata);
+    AetherClient.setAclReadersParam(params, options.aclReaders);
     this.applyPartitionParam(params);
     if (options.chunking?.chunkSize) {
       params.set("chunk_size", options.chunking.chunkSize.toString());
@@ -2160,10 +2656,15 @@ export class AetherClient {
     }
     // Build each wire item without mutating the caller's array: comma-join the
     // `tags` list to a CSV string (the server item field is a string, not an
-    // array) and, when scoped, stamp the partition on every item.
+    // array) and, when scoped, stamp the partition on every item. `acl_readers`
+    // is also comma-joined, but NOT via csvField — an explicit empty array is
+    // meaningful (admin-only quarantine) and must survive as an empty string.
     const items = documents.map((d) => {
       const item: Record<string, unknown> = { ...d };
       AetherClient.csvField(item, "tags", d.tags);
+      if (d.acl_readers !== undefined) {
+        item.acl_readers = AetherClient.aclReadersCsv(d.acl_readers);
+      }
       if (this.partitionId) item.partition = this.partitionId;
       return item;
     });
@@ -2190,7 +2691,7 @@ export class AetherClient {
    * processes all queries in one round-trip.
    *
    * @param queries - Array of search queries, each with `q` and optional `k`, `tags`, `include_content`,
-   *   filters (`entity_id`, `since`, `until`, `last_n_days`, `max_distance`), recency tuning
+   *   filters (`entity_id`, `threadId`, `since`, `until`, `last_n_days`, `max_distance`), recency tuning
    *   (`recency_weight`, `half_life_days`), and freshness tuning
    *   (`freshness_weight`, `freshness_half_life_days`).
    * @returns Array of batch search responses, one per input query, each containing its results.
@@ -2205,7 +2706,12 @@ export class AetherClient {
     // so join the ergonomic array fields and drop empties. When scoped, stamp the
     // same partition on every query. Never mutates the caller's array.
     const wireQueries = queries.map((q) => {
-      const wire: Record<string, unknown> = { ...q };
+      const { threadId, ...query } = q;
+      const wire: Record<string, unknown> = { ...query };
+      if (threadId !== undefined) {
+        AetherClient.validateThreadId(threadId);
+        wire.thread_id = threadId;
+      }
       AetherClient.csvField(wire, "tags", q.tags);
       AetherClient.csvField(wire, "any_tags", q.any_tags);
       AetherClient.csvField(wire, "content_type", q.content_type);

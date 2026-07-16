@@ -3,6 +3,41 @@
 All notable changes to `@aether-ai/sdk` are documented here. This project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0
+
+Additive release — no breaking changes. Existing code continues to work
+unchanged; every new field is optional and defaults to the prior behavior.
+
+### Added
+
+- **Per-user permissions & audit.** Documents can carry a read-ACL, and a client
+  handle can act on behalf of a principal so reads are filtered by that ACL.
+  - Pass `aclReaders: ["user:alice", "group:eng"]` to `insert`, `insertText`,
+    `ingestFiles`, and `ingestDirectory` to restrict who can read a document.
+    Omit it (or pass `[]`) for the admin-only default.
+  - `client.asPrincipal("user:alice", { groups: [...] })` returns a scoped
+    client whose reads and searches only surface documents the principal is
+    allowed to see (unlabeled documents plus those whose ACL names it or one of
+    its groups). Composes with `client.partition(...)`. Admin-role keys bypass
+    filtering.
+  - `client.audit.access(query?)` (`AuditOps`) queries the tenant's access-audit
+    log — document reads, search deliveries, denials, and admin bypasses —
+    returning an `AccessAuditPage`. New `AccessAuditQuery` and `AccessAuditPage`
+    types. Requires access-audit capture to be enabled for the tenant.
+  - New typed error `PrincipalPinMismatchError` (HTTP 403,
+    `code: "principal_pin_mismatch"`) thrown when a principal-pinned API key is
+    asked to assert a different principal. Not retryable.
+- **Durable conversation threads.** `client.appendThread(...)` and
+  `client.getThread(...)` store and replay an ordered message history for an
+  agent or chat session, with a `memory.thread(threadId)` facade. New `Thread`,
+  `ConversationThread`, `ThreadAppendInput`, and `ThreadReadOptions` exports.
+- **Shared grounding provenance receipts.** New `GroundingReceipt`,
+  `GroundingBinding`, `GroundingSource`, `GroundingTrustSignal`,
+  `GroundingSetAttestation`, `ReceiptAttestation`, and `ShareableReceipt` types
+  expose signed, shareable provenance for a generated answer's sources.
+- **Multimodal recall.** Image and audio memories via `MediaSource` /
+  `MediaRememberInput`, surfaced through the new `MediaMemoryRecord` type.
+
 ## 0.4.0
 
 Additive release — no breaking changes. Existing code continues to work

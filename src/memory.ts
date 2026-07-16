@@ -1,4 +1,6 @@
-import { AetherClient, type AetherClientOptions } from "./client.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { AetherClient, validateThreadId, type AetherClientOptions } from "./client.js";
 import { AetherError } from "./errors.js";
 import type {
   DocumentRecord,
@@ -33,6 +35,29 @@ export interface MemoryItem {
    * **Relative within a single `recall` call; not comparable across calls.**
    */
   score?: number;
+  /** `image` or `audio` for multimodal memories; absent for text. */
+  modality?: "image" | "audio";
+}
+
+/** Browser/Node inputs accepted by the multimodal `remember` overload. */
+export type MediaSource = Uint8Array | ArrayBuffer | Blob | URL | string;
+
+export interface MediaRememberInput {
+  /** Exactly one of `image` or `audio` is required. */
+  image?: MediaSource;
+  /** Exactly one of `image` or `audio` is required. */
+  audio?: MediaSource;
+  /** Optional caller-derived image caption (bypasses server VLM egress). */
+  caption?: string;
+  /** Optional caller-derived audio transcript (bypasses transcription egress). */
+  transcript?: string;
+  /** Default `true`; `false` requires an explicit `transcript`. */
+  transcribe?: boolean;
+  /** Required only when MIME cannot be inferred from Blob/header/path/magic. */
+  contentType?: string;
+  filename?: string;
+  metadata?: Metadata;
+  source?: string;
 }
 
 /**
@@ -354,6 +379,21 @@ function requireNonEmpty(name: string, value: string): void {
 // ── Recency re-rank tuning (contract §4 Mode B) ───────────────────────
 const OVERFETCH = 4;
 const MAX_CANDIDATES = 100;
+const DEFAULT_THREAD_TURNS = 10;
+const THREAD_SEMANTIC_MATCHES = 5;
+const MAX_THREAD_TURNS = 1_000;
+const THREAD_DOWNLOAD_CONCURRENCY = 8;
+const THREAD_CONTEXT_MAX_BYTES = 16 * 1024 * 1024;
+
+function addThreadContextBytes(total: number, text: string): number {
+  const next = total + new TextEncoder().encode(text).byteLength;
+  if (next > THREAD_CONTEXT_MAX_BYTES) {
+    throw new AetherError(
+      `thread context exceeds the ${THREAD_CONTEXT_MAX_BYTES}-byte safety limit`,
+    );
+  }
+  return next;
+}
 
 /** Maximum `entity_id` length accepted by the server. */
 const MAX_ENTITY_ID_LEN = 256;
@@ -397,12 +437,95 @@ function similarity(score: number): number {
   return score / 100;
 }
 
+function sniffMediaType(
+  bytes: Uint8Array,
+  modality: "image" | "audio",
+): string | undefined {
+  const starts = (...prefix: number[]): boolean =>
+    prefix.every((value, index) => bytes[index] === value);
+  const ascii = (offset: number, value: string): boolean =>
+    value.split("").every((char, index) => bytes[offset + index] === char.charCodeAt(0));
+  if (modality === "image") {
+    if (starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "image/png";
+    if (starts(0xff, 0xd8, 0xff)) return "image/jpeg";
+    if (ascii(0, "GIF87a") || ascii(0, "GIF89a")) return "image/gif";
+    if (ascii(0, "RIFF") && ascii(8, "WEBP")) return "image/webp";
+  } else {
+    if (ascii(0, "RIFF") && ascii(8, "WAVE")) return "audio/wav";
+    if (ascii(0, "ID3") || starts(0xff, 0xfb) || starts(0xff, 0xf3)) return "audio/mpeg";
+    if (ascii(0, "OggS")) return "audio/ogg";
+    if (ascii(0, "fLaC")) return "audio/flac";
+    if (starts(0x1a, 0x45, 0xdf, 0xa3)) return "audio/webm";
+    if (ascii(4, "ftyp")) return "audio/mp4";
+  }
+  return undefined;
+}
+
+function mediaTypeFromName(
+  name: string | undefined,
+  modality: "image" | "audio",
+): string | undefined {
+  if (!name) return undefined;
+  const ext = name.toLowerCase().split(/[?#]/, 1)[0].match(/\.[^.\/]+$/)?.[0];
+  const types: Record<string, string> = modality === "image"
+    ? { ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif" }
+    : { ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".wav": "audio/wav", ".webm": "audio/webm", ".ogg": "audio/ogg", ".flac": "audio/flac" };
+  return ext ? types[ext] : undefined;
+}
+
+async function loadMediaSource(
+  source: MediaSource,
+  modality: "image" | "audio",
+  explicitType?: string,
+  explicitName?: string,
+): Promise<{ bytes: Uint8Array; contentType: string; filename?: string }> {
+  let bytes: Uint8Array;
+  let detectedType: string | undefined;
+  let filename = explicitName;
+  if (source instanceof Uint8Array) {
+    bytes = source;
+  } else if (source instanceof ArrayBuffer) {
+    bytes = new Uint8Array(source);
+  } else if (typeof Blob !== "undefined" && source instanceof Blob) {
+    bytes = new Uint8Array(await source.arrayBuffer());
+    detectedType = source.type || undefined;
+    filename = filename ?? ("name" in source ? String((source as File).name) : undefined);
+  } else if (source instanceof URL || typeof source === "string") {
+    const raw = source instanceof URL ? source.toString() : source;
+    if (/^https?:\/\//i.test(raw)) {
+      const response = await fetch(raw);
+      if (!response.ok) {
+        throw new AetherError(`media URL returned HTTP ${response.status}`);
+      }
+      bytes = new Uint8Array(await response.arrayBuffer());
+      detectedType = response.headers.get("content-type") ?? undefined;
+      filename = filename ?? new URL(raw).pathname.split("/").filter(Boolean).pop();
+    } else {
+      bytes = new Uint8Array(await fs.promises.readFile(raw));
+      filename = filename ?? path.basename(raw);
+    }
+  } else {
+    throw new AetherError("unsupported media source");
+  }
+  if (bytes.byteLength === 0) throw new AetherError("media must not be empty");
+  const contentType =
+    explicitType?.split(";", 1)[0].trim().toLowerCase() ||
+    detectedType?.split(";", 1)[0].trim().toLowerCase() ||
+    mediaTypeFromName(filename, modality) ||
+    sniffMediaType(bytes, modality);
+  if (!contentType) {
+    throw new AetherError("contentType is required for unrecognized media bytes");
+  }
+  return { bytes, contentType, filename };
+}
+
 /**
  * Entity-scoped, ergonomic facade over {@link AetherClient}.
  *
  * `Memory` **owns** a raw client (composition, not inheritance) and scopes every
- * operation to a single `entityId` fixed at construction. It adds no HTTP routes,
- * no new error types, and changes no raw-client behavior — all transport, retry,
+ * operation to a single `entityId` fixed at construction. Text calls compose
+ * document routes and media calls use `/memory/media`; it adds no new error
+ * types and changes no raw-client behavior — all transport, retry,
  * timeout, and error semantics are inherited unchanged.
  *
  * @example
@@ -444,6 +567,16 @@ export class Memory {
     this.now = options.now ?? (() => new Date());
   }
 
+  /** Bind an ordered conversation helper to this Memory's entity scope. */
+  thread(threadId: string): Thread {
+    return new Thread(this, threadId);
+  }
+
+  /** @internal Shared only with the composed Thread helper in this module. */
+  rawClientForThread(): AetherClient {
+    return this.client;
+  }
+
   /**
    * Store one memory for the entity. **One HTTP call.**
    *
@@ -473,7 +606,62 @@ export class Memory {
     text: string,
     metadata?: Metadata,
     options?: { extract?: boolean },
+  ): Promise<MemoryItem>;
+  async remember(input: MediaRememberInput): Promise<MemoryItem>;
+  async remember(
+    textOrMedia: string | MediaRememberInput,
+    metadata?: Metadata,
+    options?: { extract?: boolean },
   ): Promise<MemoryItem> {
+    if (typeof textOrMedia !== "string") {
+      const input = textOrMedia;
+      const modality = input.image !== undefined
+        ? "image"
+        : input.audio !== undefined
+          ? "audio"
+          : undefined;
+      if (!modality || (input.image !== undefined && input.audio !== undefined)) {
+        throw new AetherError("provide exactly one of image or audio");
+      }
+      if (modality === "audio" && input.transcribe === false && input.transcript == null) {
+        throw new AetherError("transcribe=false requires an explicit transcript");
+      }
+      if (modality === "image" && input.transcript !== undefined) {
+        throw new AetherError("transcript is valid only for audio memories");
+      }
+      if (modality === "audio" && input.caption !== undefined) {
+        throw new AetherError("caption is valid only for image memories");
+      }
+      const source = modality === "image" ? input.image! : input.audio!;
+      const media = await loadMediaSource(
+        source,
+        modality,
+        input.contentType,
+        input.filename,
+      );
+      const tags = this.encodeLegacyMetadataTags(input.metadata);
+      const record = await this.client.rememberMedia(media.bytes, {
+        modality,
+        contentType: media.contentType,
+        entityId: this.entityId,
+        filename: media.filename,
+        caption: input.caption,
+        transcript: input.transcript,
+        tags: tags.length > 0 ? tags : undefined,
+        metadata: input.metadata,
+        source: input.source,
+      });
+      return {
+        id: record.doc_id,
+        text: record.derived_text,
+        createdAt: record.created_at,
+        entityId: record.entity_id ?? this.entityId,
+        metadata: record.metadata ?? input.metadata ?? {},
+        modality: record.modality,
+      };
+    }
+
+    const text = textOrMedia;
     if (!text || text.trim().length === 0) {
       throw new AetherError("text is required");
     }
@@ -539,6 +727,7 @@ export class Memory {
         entityId: this.entityId,
         metadata: h.metadata ?? {},
         score: similarity(h.score),
+        modality: h.modality,
       }));
     }
 
@@ -582,6 +771,7 @@ export class Memory {
       entityId: this.entityId,
       metadata: s.c.metadata ?? {},
       score: s.blended,
+      modality: s.c.modality,
     }));
   }
 
@@ -610,15 +800,18 @@ export class Memory {
       limit,
     });
     const capped = documents.slice(0, limit);
-    const texts = await Promise.all(
-      capped.map((r) => this.client.downloadText(r.doc_id)),
-    );
+    const texts = await Promise.all(capped.map((r) =>
+      r.modality && r.derived_text !== undefined
+        ? Promise.resolve(r.derived_text)
+        : this.client.downloadText(r.doc_id),
+    ));
     return capped.map((r, i) => ({
       id: r.doc_id,
       text: texts[i],
       createdAt: r.created_at,
       entityId: r.entity_id ?? this.entityId,
       metadata: r.metadata ?? {},
+      modality: r.modality,
     }));
   }
 
@@ -936,5 +1129,119 @@ export class Memory {
       tags.push(`${key}:${value}`);
     }
     return tags;
+  }
+}
+
+/**
+ * Entity-scoped ordered conversation helper composed over {@link Memory}.
+ * Construct directly as `new Thread(memory, threadId)` or via
+ * `memory.thread(threadId)`.
+ */
+export class Thread {
+  readonly threadId: string;
+
+  private readonly memory: Memory;
+  private readonly client: AetherClient;
+
+  constructor(memory: Memory, threadId: string) {
+    validateThreadId(threadId);
+    this.memory = memory;
+    this.client = memory.rawClientForThread();
+    this.threadId = threadId;
+  }
+
+  /** Append one turn, automatically scoped to the Memory's entity. */
+  async append(text: string, metadata?: Metadata): Promise<MemoryItem> {
+    if (!text || text.trim().length === 0) {
+      throw new AetherError("text is required");
+    }
+    const record = await this.client.appendThread(this.threadId, {
+      text,
+      metadata,
+      entityId: this.memory.entityId,
+    });
+    return {
+      id: record.doc_id,
+      text,
+      createdAt: record.created_at,
+      entityId: record.entity_id ?? this.memory.entityId,
+      metadata: record.metadata ?? metadata ?? {},
+    };
+  }
+
+  /**
+   * Compose recent ordered turns with semantic matches from this same entity +
+   * thread. Recent turns come first (chronological unless `recentFirst`), then
+   * up to five additional relevance-ordered matches. Duplicate document ids
+   * are returned once. The default ten-turn window prevents unbounded prompt
+   * downloads; `lastNTurns` must be 1–1000. At most eight downloads run at
+   * once and recent + semantic content shares a 16 MiB UTF-8 byte budget.
+   */
+  async context(
+    query: string,
+    lastNTurns = DEFAULT_THREAD_TURNS,
+    recentFirst = false,
+  ): Promise<MemoryItem[]> {
+    if (!query || query.trim().length === 0) {
+      throw new AetherError("query is required");
+    }
+    if (
+      !Number.isInteger(lastNTurns)
+      || lastNTurns < 1
+      || lastNTurns > MAX_THREAD_TURNS
+    ) {
+      throw new AetherError(
+        `lastNTurns must be an integer between 1 and ${MAX_THREAD_TURNS}`,
+      );
+    }
+
+    const [thread, matches] = await Promise.all([
+      this.client.getThread(this.threadId, { lastNTurns, recentFirst }),
+      this.client.retrieve(query, THREAD_SEMANTIC_MATCHES, {
+        entityId: this.memory.entityId,
+        threadId: this.threadId,
+      }),
+    ]);
+    const records = thread.documents.filter(
+      (record) => record.entity_id === this.memory.entityId,
+    );
+    const texts: string[] = [];
+    let contextBytes = 0;
+    for (
+      let offset = 0;
+      offset < records.length;
+      offset += THREAD_DOWNLOAD_CONCURRENCY
+    ) {
+      const downloaded = await Promise.all(
+        records
+          .slice(offset, offset + THREAD_DOWNLOAD_CONCURRENCY)
+          .map((record) => this.client.downloadText(record.doc_id)),
+      );
+      for (const text of downloaded) {
+        contextBytes = addThreadContextBytes(contextBytes, text);
+      }
+      texts.push(...downloaded);
+    }
+    const items: MemoryItem[] = records.map((record, index) => ({
+      id: record.doc_id,
+      text: texts[index],
+      createdAt: record.created_at,
+      entityId: record.entity_id ?? this.memory.entityId,
+      metadata: record.metadata ?? {},
+    }));
+    const seen = new Set(items.map((item) => item.id));
+    for (const match of matches) {
+      if (seen.has(match.doc_id)) continue;
+      seen.add(match.doc_id);
+      contextBytes = addThreadContextBytes(contextBytes, match.content);
+      items.push({
+        id: match.doc_id,
+        text: match.content,
+        entityId: this.memory.entityId,
+        metadata: match.metadata ?? {},
+        score: similarity(match.score),
+      });
+    }
+    return items;
   }
 }
