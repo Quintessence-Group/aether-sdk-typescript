@@ -1,9 +1,12 @@
 name: Release
 
-# Publishes @aether-ai/sdk to npm using Trusted Publishing (OIDC).
-# Once the trusted publisher is registered, no long-lived token is stored: npm
-# (>= 11.5.1) exchanges the GitHub OIDC token for short-lived credentials at
-# publish time and attaches provenance automatically.
+# Publishes @aether-ai/sdk to npm. Two auth paths (see the Publish step):
+#   1. NPM_TOKEN repo secret set -> classic token publish (no provenance). This
+#      is the working path today; the npm Trusted Publisher (OIDC) has NOT been
+#      registered for this package yet. The @aether-ai-scoped automation token
+#      already stored on aether-plans works here (same scope).
+#   2. No token -> OIDC trusted publishing (preferred once registered): no stored
+#      token, short-lived credentials, provenance attached automatically.
 #
 # Trigger:  git tag v<version> && git push origin v<version>
 #           (the tag must match package.json's "version")
@@ -62,13 +65,22 @@ jobs:
             exit 1
           fi
 
-      # Publishes via OIDC trusted publishing — NO stored token. The npm Trusted Publisher is
-      # registered at npmjs.com (@aether-ai/sdk -> Settings -> Trusted Publisher ->
-      #   repo: Quintessence-Group/aether-sdk-typescript | workflow: release.yml | environment: prod),
-      # so npm >= 11.5.1 authenticates with the short-lived GitHub OIDC token minted for this run
-      # and attaches provenance automatically. (id-token: write above is what enables the exchange.)
-      - name: Publish to npm (OIDC trusted publishing)
+      # Two supported auth paths, tried in this order:
+      #  1. NPM_TOKEN secret present  -> classic token publish (NO provenance).
+      #     Use this until the npm Trusted Publisher is registered. The token must
+      #     have publish rights on the @aether-ai scope (the same automation token
+      #     already used by aether-plans works — same scope).
+      #  2. No token -> OIDC trusted publishing (preferred; short-lived creds +
+      #     provenance). Requires the Trusted Publisher registered at npmjs.com
+      #     (@aether-ai/sdk -> Settings -> Trusted Publisher ->
+      #       repo: Quintessence-Group/aether-sdk-typescript | workflow: release.yml | environment: prod)
+      #     and npm >= 11.5.1. `id-token: write` above enables the exchange.
+      # Provenance requires the OIDC exchange, so it is only attached on path 2.
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           PKG_VERSION=$(node -p "require('./package.json').version")
           # Prerelease versions (contain a hyphen, e.g. 0.4.0-rc.1) must NOT move `latest`.
           if [[ "$PKG_VERSION" == *-* ]]; then
@@ -77,7 +89,13 @@ jobs:
             NPM_TAG=latest
           fi
           echo "Publishing $PKG_VERSION to dist-tag '$NPM_TAG'"
-          npm publish --provenance --access public --tag "$NPM_TAG"
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "Auth: NPM_TOKEN (classic token publish, no provenance)"
+            npm publish --access public --tag "$NPM_TAG"
+          else
+            echo "Auth: GitHub OIDC trusted publishing (with provenance)"
+            npm publish --provenance --access public --tag "$NPM_TAG"
+          fi
 
       - name: Install smoke from npm
         working-directory: /tmp
