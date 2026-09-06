@@ -1244,4 +1244,47 @@ export class Thread {
     }
     return items;
   }
+
+  // ── Lifecycle ───────────────────────────────────────────
+
+  /**
+   * Restore this thread after a soft {@link delete}, un-tombstoning every turn
+   * so it is visible again. Idempotent — restoring a live thread is a no-op
+   * that still succeeds.
+   */
+  async restore(): Promise<void> {
+    await this.client.restoreThread(this.threadId);
+  }
+
+  /**
+   * Rewrite the intra-tenant read-ACL on every turn in this thread. `null`
+   * unlabels the thread (tenant-visible); `[]` quarantines it to admin-role
+   * keys only; a non-empty list restricts reads to those `user:` / `group:`
+   * labels. Mirrors the `aclReaders` insert semantics.
+   */
+  async setAcl(readers: string[] | null): Promise<void> {
+    await this.client.setThreadAcl(this.threadId, readers);
+  }
+
+  /**
+   * Re-home this thread to another partition (metadata only — no re-embed). The
+   * thread's current partition scope is asserted as `expect_partition`, so a
+   * handle scoped to the wrong partition gets the same 404 a genuine miss does.
+   * Pass `null` to move into the tenant's default partition.
+   */
+  async move(toPartition: string | null): Promise<void> {
+    await this.client.moveThread(this.threadId, {
+      expectPartition: this.client.scopedPartition() ?? null,
+      toPartition,
+    });
+  }
+
+  /**
+   * Delete this thread. The default is a reversible soft tombstone (restore
+   * with {@link restore}); `hard: true` is the terminal, irreversible
+   * cryptographic erasure (GDPR right-to-be-forgotten) with no restore.
+   */
+  async delete(hard = false): Promise<void> {
+    await this.client.deleteThread(this.threadId, { hard });
+  }
 }

@@ -104,6 +104,32 @@ export class PrincipalPinMismatchError extends AetherApiError {
 }
 
 /**
+ * Thrown when a connect-session token is unknown, already consumed, or
+ * expired (HTTP 400, `code: "session_invalid"`). The three cases are
+ * deliberately indistinguishable — mint a new session with
+ * `createConnectSession` rather than retrying the same token.
+ */
+export class SessionInvalidError extends AetherApiError {
+  constructor(status: number, statusText: string, body: AetherErrorBody) {
+    super(status, statusText, body);
+    this.name = "SessionInvalidError";
+  }
+}
+
+/**
+ * Thrown when `createConnectSession`'s asserted `?partition=` (from a
+ * partition handle) disagrees with the partition the session would actually
+ * resolve to (HTTP 400, `code: "partition_mismatch"`). Mint on a handle
+ * scoped to the same `externalUserId` you are passing, or omit the handle.
+ */
+export class PartitionMismatchError extends AetherApiError {
+  constructor(status: number, statusText: string, body: AetherErrorBody) {
+    super(status, statusText, body);
+    this.name = "PartitionMismatchError";
+  }
+}
+
+/**
  * Build the most-specific `AetherApiError` subclass for the given response.
  * The factory inspects the structured `code` field (Phase 8 / ADR-015 wire
  * shape); unknown codes fall back to the base `AetherApiError`.
@@ -127,6 +153,12 @@ export function aetherApiErrorFromResponse(
   }
   if (status === 400 && body.code === "partition_required") {
     return new PartitionRequiredError(status, statusText, body);
+  }
+  if (status === 400 && body.code === "session_invalid") {
+    return new SessionInvalidError(status, statusText, body);
+  }
+  if (status === 400 && body.code === "partition_mismatch") {
+    return new PartitionMismatchError(status, statusText, body);
   }
   return new AetherApiError(status, statusText, body);
 }
