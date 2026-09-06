@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import {
   AetherError,
   AetherApiError,
@@ -16,12 +17,19 @@ import type {
   BatchSearchQuery,
   BatchSearchResponse,
   ChunkingConfig,
+  Connection,
+  ConnectionBrowsePage,
+  ConnectionPurgeReceipt,
+  ConnectSession,
   ConversationThread,
+  CreateConnectSessionOptions,
+  DisconnectResult,
   DocumentRecord,
   EntityBackfillReport,
   FieldSchema,
   FieldSchemaInput,
   GroundingReceipt,
+  ListConnectionsOptions,
   QueryGroup,
   QueryPage,
   SchemaOps,
@@ -39,6 +47,7 @@ import type {
   SearchResult,
   SearchTrace,
   ThreadAppendInput,
+  ThreadLifecycleResult,
   ThreadReadOptions,
   TracedSearch,
 } from "./models.js";
@@ -273,6 +282,135 @@ const UNVERSIONED_PATHS = new Set(["/status"]);
 function versionedPath(path: string): string {
   const bare = path.split("?", 1)[0];
   return UNVERSIONED_PATHS.has(bare) ? path : `${API_VERSION_PREFIX}${path}`;
+}
+
+// ── Connections + connect sessions ─────────────────────────
+
+/** Wire shape of one `GET /v1/connections` / `GET /v1/connections/{id}` entry. */
+interface RawConnection {
+  connection_id: string;
+  provider: string;
+  owner_type: "tenant" | "external_user";
+  owner_id?: string | null;
+  provider_account_id: string;
+  account_display_name?: string | null;
+  target_partition?: string | null;
+  status: string;
+  granted_scopes: string[];
+  created_at: string;
+  last_sync_at?: string | null;
+  last_error?: string | null;
+  files_synced: number;
+  files_skipped: number;
+  files_deleted: number;
+  selected_paths: string[];
+  purge_state: "not_started" | "in_flight" | "complete";
+  purge_receipt_id?: string | null;
+  credential_deleted: boolean;
+  identity_redacted?: boolean;
+}
+
+function normalizeConnection(raw: RawConnection): Connection {
+  return {
+    connectionId: raw.connection_id,
+    provider: raw.provider,
+    ownerType: raw.owner_type,
+    ownerId: raw.owner_id ?? undefined,
+    providerAccountId: raw.provider_account_id,
+    accountDisplayName: raw.account_display_name ?? undefined,
+    targetPartition: raw.target_partition ?? undefined,
+    status: raw.status,
+    grantedScopes: raw.granted_scopes,
+    createdAt: raw.created_at,
+    lastSyncAt: raw.last_sync_at ?? undefined,
+    lastError: raw.last_error ?? undefined,
+    filesSynced: raw.files_synced,
+    filesSkipped: raw.files_skipped,
+    filesDeleted: raw.files_deleted,
+    selectedPaths: raw.selected_paths,
+    purgeState: raw.purge_state,
+    purgeReceiptId: raw.purge_receipt_id ?? undefined,
+    credentialDeleted: raw.credential_deleted,
+    // Defaulted, not required: an older engine simply never redacts.
+    identityRedacted: raw.identity_redacted ?? false,
+  };
+}
+
+/** Wire shape of `GET /v1/connections/purge-receipts/{id}`. */
+interface RawPurgeReceipt {
+  version: string;
+  receipt_id: string;
+  tenant_id: string;
+  connection_id: string;
+  provider: string;
+  owner: string;
+  provider_account_id: string;
+  documents_purged: number;
+  documents_failed: number;
+  merkle_root: string;
+  merkle_leaf_count: number;
+  purged_document_ids: string[];
+  partitions_touched: string[];
+  default_partition_touched: boolean;
+  credential_revocation: string;
+  credential_deleted: boolean;
+  started_at: string;
+  completed_at: string;
+  signer_node_id: string;
+  signer_public_key: string;
+  signature: string;
+  verified: boolean;
+}
+
+function normalizePurgeReceipt(raw: RawPurgeReceipt): ConnectionPurgeReceipt {
+  return {
+    version: raw.version,
+    receiptId: raw.receipt_id,
+    tenantId: raw.tenant_id,
+    connectionId: raw.connection_id,
+    provider: raw.provider,
+    owner: raw.owner,
+    providerAccountId: raw.provider_account_id,
+    documentsPurged: raw.documents_purged,
+    documentsFailed: raw.documents_failed,
+    merkleRoot: raw.merkle_root,
+    merkleLeafCount: raw.merkle_leaf_count,
+    purgedDocumentIds: raw.purged_document_ids,
+    partitionsTouched: raw.partitions_touched,
+    defaultPartitionTouched: raw.default_partition_touched,
+    credentialRevocation: raw.credential_revocation,
+    credentialDeleted: raw.credential_deleted,
+    startedAt: raw.started_at,
+    completedAt: raw.completed_at,
+    signerNodeId: raw.signer_node_id,
+    signerPublicKey: raw.signer_public_key,
+    signature: raw.signature,
+    verified: raw.verified,
+  };
+}
+
+/**
+ * Verify a `createConnectSession` redirect's signature (`docs/SDK_API_CONTRACT.md`
+ * §4.18) — a pure, offline check, safe to run in whatever request handler the
+ * application's backend uses for the OAuth callback.
+ *
+ * `clientSecret` is the value returned exactly once by `createConnectSession`.
+ * The comparison is constant-time (`crypto.timingSafeEqual`) so this function
+ * itself never becomes a timing oracle on the signature.
+ *
+ * @returns `true` iff `params.sig` matches the recomputed signature.
+ */
+export function verifyConnectRedirectSignature(
+  clientSecret: string,
+  params: { session: string; status: string; connectionId: string; sig: string },
+): boolean {
+  const key = createHash("sha256").update(clientSecret, "utf8").digest();
+  const message = `${params.session}|${params.status}|${params.connectionId}`;
+  const expected = createHmac("sha256", key).update(message, "utf8").digest("hex");
+  const expectedBuf = Buffer.from(expected, "hex");
+  const actualBuf = Buffer.from(params.sig, "hex");
+  if (expectedBuf.length !== actualBuf.length) return false;
+  return timingSafeEqual(expectedBuf, actualBuf);
 }
 
 export class AetherClient {
@@ -910,6 +1048,207 @@ export class AetherClient {
     };
   }
 
+  // ── Thread lifecycle ────────────────────────────────────
+  //
+  // Owner/admin-scoped whole-thread mutations. Every route requires a stable
+  // `Idempotency-Key` header exactly like `appendThread`: the SDK mints one per
+  // logical call (reused across the call's transport retries) unless the caller
+  // supplies `idempotencyKey`. Partition-guarded routes (restore / set-ACL /
+  // delete) carry the scoped partition as a `?partition=` query param, the same
+  // way `appendThread` / `getThread` do; `moveThread` instead asserts it in the
+  // body as `expect_partition`, mirroring {@link moveDocument}.
+
+  /**
+   * Restore (un-tombstone) a previously soft-{@link deleteThread}d conversation
+   * so every turn is visible on `/threads` again. Idempotent — restoring a live
+   * thread is a no-op that still succeeds.
+   *
+   * On a partition handle the partition is sent as a guard: a thread that lives
+   * in a different partition returns the same 404 as a nonexistent one.
+   *
+   * @param threadId - Conversation thread id.
+   * @param options.idempotencyKey - Stable caller key for retry-safe restore.
+   *   Omit to let the SDK mint one for this call and its transport retries.
+   * @throws {AetherError} If `threadId` is invalid (client-side).
+   * @throws {AetherApiError} On non-2xx API response (e.g. 404 if no such thread).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async restoreThread(
+    threadId: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<ThreadLifecycleResult> {
+    AetherClient.validateThreadId(threadId);
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const headers: Record<string, string> = {
+      "Idempotency-Key": options?.idempotencyKey ?? randomUUID(),
+    };
+    const suffix = params.toString();
+    return this._request<ThreadLifecycleResult>(
+      `/threads/${encodeURIComponent(threadId)}/restore${suffix ? `?${suffix}` : ""}`,
+      { method: "POST", headers },
+    );
+  }
+
+  /**
+   * Rewrite the intra-tenant read-ACL on every turn in a conversation. The
+   * three states mirror the `aclReaders` insert semantics exactly: `null`
+   * unlabels the thread (tenant-visible); `[]` quarantines it to admin-role
+   * keys only; a non-empty list restricts reads to those `user:` / `group:`
+   * labels. Non-null labels are validated client-side (no empty or comma-bearing
+   * label) like the insert family.
+   *
+   * On a partition handle the partition is sent as a guard.
+   *
+   * @param threadId - Conversation thread id.
+   * @param aclReaders - Target read-ACL: `null` (unlabel), `[]` (admin-only), or labels.
+   * @param options.idempotencyKey - Stable caller key for retry-safe ACL change.
+   * @throws {AetherError} If `threadId` or a reader label is invalid (client-side).
+   * @throws {AetherApiError} On non-2xx API response (e.g. 404 if no such thread).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async setThreadAcl(
+    threadId: string,
+    aclReaders: string[] | null,
+    options?: { idempotencyKey?: string },
+  ): Promise<ThreadLifecycleResult> {
+    AetherClient.validateThreadId(threadId);
+    // `null` unlabels; `[]` is the valid admin-only quarantine; a non-null list
+    // gets the same client-side shape check the insert/update ACL surfaces use.
+    if (aclReaders !== null) AetherClient.validateAclReaders(aclReaders);
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Idempotency-Key": options?.idempotencyKey ?? randomUUID(),
+    };
+    const suffix = params.toString();
+    return this._request<ThreadLifecycleResult>(
+      `/threads/${encodeURIComponent(threadId)}/acl${suffix ? `?${suffix}` : ""}`,
+      { method: "PUT", headers, body: JSON.stringify({ acl_readers: aclReaders }) },
+    );
+  }
+
+  /**
+   * Re-home a whole conversation to another partition (metadata only — content,
+   * `cid`, chunks, and vectors are untouched; no re-embed). Mirrors
+   * {@link moveDocument}'s body: both sides are required and an explicit `null`
+   * names the tenant's default partition. `expectPartition` asserts where the
+   * thread lives **now** — a wrong assertion, a missing id, or a tombstoned
+   * thread all return the same 404 as a nonexistent one (never a partition
+   * oracle). A destination that already holds a thread with this id is a 409.
+   *
+   * Like {@link moveDocument}, this is deliberately **not** query-scoped by a
+   * partition handle: both partitions are always named explicitly in the body.
+   *
+   * @param threadId - Conversation thread id.
+   * @param options.expectPartition - Where the thread lives now, or `null` for default.
+   * @param options.toPartition - Destination partition, or `null` for default.
+   * @param options.idempotencyKey - Stable caller key for retry-safe move.
+   * @throws {AetherError} If `threadId` is invalid, or a non-null partition is
+   *   empty/whitespace or longer than 256 characters (client-side).
+   * @throws {AetherApiError} On non-2xx API response (404 miss, 409 collision).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async moveThread(
+    threadId: string,
+    options: {
+      expectPartition: string | null;
+      toPartition: string | null;
+      idempotencyKey?: string;
+    },
+  ): Promise<ThreadLifecycleResult> {
+    AetherClient.validateThreadId(threadId);
+    // Both sides must be present on the wire (an explicit `null` names the
+    // default partition), so reject `undefined` — JSON.stringify would drop the
+    // key and the server rejects the omission — and validate non-null ids like a
+    // partition handle id.
+    const sides: Array<
+      ["expectPartition" | "toPartition", string | null | undefined]
+    > = [
+      ["expectPartition", options.expectPartition],
+      ["toPartition", options.toPartition],
+    ];
+    for (const [name, value] of sides) {
+      if (value === undefined) {
+        throw new AetherError(
+          `${name} is required (use null for the default partition)`,
+        );
+      }
+      if (value === null) continue;
+      if (value.trim().length === 0) {
+        throw new AetherError(
+          `${name} must be null or a non-empty partition id`,
+        );
+      }
+      if (value.length > MAX_PARTITION_LEN) {
+        throw new AetherError(
+          `${name} must be at most ${MAX_PARTITION_LEN} characters`,
+        );
+      }
+    }
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Idempotency-Key": options.idempotencyKey ?? randomUUID(),
+    };
+    return this._request<ThreadLifecycleResult>(
+      `/threads/${encodeURIComponent(threadId)}/move`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          to_partition: options.toPartition,
+          expect_partition: options.expectPartition,
+        }),
+      },
+    );
+  }
+
+  /**
+   * Delete a whole conversation. The default is a reversible soft tombstone
+   * (restore with {@link restoreThread}); `hard: true` is the terminal,
+   * irreversible cryptographic erasure (GDPR right-to-be-forgotten) — every
+   * turn's per-document key is shredded, with no restore.
+   *
+   * On a partition handle the partition is sent as a guard.
+   *
+   * @param threadId - Conversation thread id.
+   * @param options.hard - When `true`, permanently crypto-erase instead of
+   *   tombstoning. Defaults to `false`.
+   * @param options.idempotencyKey - Stable caller key for retry-safe delete.
+   * @throws {AetherError} If `threadId` is invalid (client-side).
+   * @throws {AetherApiError} On non-2xx API response (e.g. 404 if no such thread).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async deleteThread(
+    threadId: string,
+    options?: { hard?: boolean; idempotencyKey?: string },
+  ): Promise<ThreadLifecycleResult> {
+    AetherClient.validateThreadId(threadId);
+    // `hard` crypto-erases the whole thread permanently (irreversible). The
+    // default is a recoverable tombstone.
+    const params = new URLSearchParams();
+    if (options?.hard) params.set("hard", "true");
+    this.applyPartitionParam(params);
+    const headers: Record<string, string> = {
+      "Idempotency-Key": options?.idempotencyKey ?? randomUUID(),
+    };
+    const suffix = params.toString();
+    return this._request<ThreadLifecycleResult>(
+      `/threads/${encodeURIComponent(threadId)}${suffix ? `?${suffix}` : ""}`,
+      { method: "DELETE", headers },
+    );
+  }
+
+  /**
+   * @internal The partition this instance is scoped to (or `undefined` for the
+   * default pool). Shared only with the composed {@link Thread} facade so its
+   * `move` can assert the thread's current partition as `expect_partition`.
+   */
+  scopedPartition(): string | undefined {
+    return this.partitionId;
+  }
+
   // ── Batch / directory ingestion ───────────────────────────────────
 
   /**
@@ -1483,6 +1822,242 @@ export class AetherClient {
     await this._requestRaw(`/audit/receipts/${encodeURIComponent(receiptId)}${query ? `?${query}` : ""}`, {
       method: "DELETE",
     });
+  }
+
+  // ── Connections + connect sessions ───
+
+  /**
+   * Mint a connect session — the entry point for connecting one of *your*
+   * end users' sources (mode B). Open the returned `connectUrl` in the end
+   * user's browser to start the hosted OAuth flow.
+   *
+   * On a partition handle, the handle's partition must equal the placement
+   * this session will resolve to (`options.externalUserId`, or
+   * `options.targetPartition` if given) — a scoped handle for end user X can
+   * mint a session only for X. See §4.18.
+   *
+   * `clientSecret` is returned exactly once. Store it server-side; use it
+   * with {@link verifyConnectRedirectSignature} when the end user lands back
+   * on `returnUrl`.
+   *
+   * @throws {AetherError} If `externalUserId` or `returnUrl` is empty.
+   * @throws {PartitionMismatchError} If a handle's partition disagrees with
+   *   the resolved placement.
+   * @throws {AetherApiError} On any other non-2xx API response.
+   */
+  async createConnectSession(
+    options: CreateConnectSessionOptions,
+  ): Promise<ConnectSession> {
+    if (!options.externalUserId) {
+      throw new AetherError("externalUserId is required");
+    }
+    if (!options.returnUrl) {
+      throw new AetherError("returnUrl is required");
+    }
+    const body: {
+      provider?: string;
+      external_user_id: string;
+      return_url: string;
+      target_partition?: string;
+    } = {
+      external_user_id: options.externalUserId,
+      return_url: options.returnUrl,
+    };
+    if (options.provider) body.provider = options.provider;
+    if (options.targetPartition) body.target_partition = options.targetPartition;
+
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    const raw = await this._request<{
+      session_token: string;
+      connect_url: string;
+      client_secret: string;
+      expires_at: string;
+    }>(`/connections/sessions${query ? `?${query}` : ""}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json" },
+    });
+    return {
+      sessionToken: raw.session_token,
+      connectUrl: raw.connect_url,
+      clientSecret: raw.client_secret,
+      expiresAt: raw.expires_at,
+    };
+  }
+
+  /**
+   * List connections in scope: the whole tenant when unscoped, or one
+   * partition's under a handle (§4.18).
+   */
+  async listConnections(
+    options: ListConnectionsOptions = {},
+  ): Promise<Connection[]> {
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    if (options.ownerType) params.set("owner_type", options.ownerType);
+    if (options.ownerId) params.set("owner_id", options.ownerId);
+    if (options.includePurged === false) params.set("include_purged", "false");
+    const query = params.toString();
+    const raw = await this._request<{ connections: RawConnection[] }>(
+      `/connections${query ? `?${query}` : ""}`,
+    );
+    return raw.connections.map(normalizeConnection);
+  }
+
+  /**
+   * Fetch one connection. On a handle, a connection in a different partition
+   * 404s exactly like an unknown id.
+   */
+  async getConnection(connectionId: string): Promise<Connection> {
+    if (!connectionId) throw new AetherError("connectionId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    const raw = await this._request<RawConnection>(
+      `/connections/${encodeURIComponent(connectionId)}${query ? `?${query}` : ""}`,
+    );
+    return normalizeConnection(raw);
+  }
+
+  /**
+   * Disconnect: revoke upstream, destroy the stored credential, hard-delete
+   * every document this connection synced, and issue a signed purge receipt.
+   * Idempotent — disconnecting an already-purged connection re-reports the
+   * same result. Fetch the full receipt with {@link getPurgeReceipt}.
+   */
+  async deleteConnection(connectionId: string): Promise<DisconnectResult> {
+    if (!connectionId) throw new AetherError("connectionId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    const raw = await this._request<{
+      connection_id: string;
+      status: string;
+      purge: {
+        receipt_id: string;
+        documents_purged: number;
+        merkle_root: string;
+        completed_at: string;
+        signer_node_id: string;
+      } | null;
+    }>(`/connections/${encodeURIComponent(connectionId)}${query ? `?${query}` : ""}`, {
+      method: "DELETE",
+    });
+    return {
+      connectionId: raw.connection_id,
+      status: raw.status,
+      purge: raw.purge
+        ? {
+            receiptId: raw.purge.receipt_id,
+            documentsPurged: raw.purge.documents_purged,
+            merkleRoot: raw.purge.merkle_root,
+            completedAt: raw.purge.completed_at,
+            signerNodeId: raw.purge.signer_node_id,
+          }
+        : undefined,
+    };
+  }
+
+  /**
+   * Re-drive sync for one connection. Honest, narrow semantics: this clears
+   * the connection's backoff and (if it was paused/errored) flips it back to
+   * active — it does **not** run a sync inline. The connection becomes
+   * eligible on the sync loop's next scheduled pass.
+   */
+  async resyncConnection(connectionId: string): Promise<Connection> {
+    if (!connectionId) throw new AetherError("connectionId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    const raw = await this._request<{ connection_id: string; status: string }>(
+      `/connections/${encodeURIComponent(connectionId)}/resync${query ? `?${query}` : ""}`,
+      { method: "POST" },
+    );
+    // The resync response is a slim {connection_id, status}; fetch the full
+    // record so callers get one consistent `Connection` shape everywhere.
+    void raw;
+    return this.getConnection(connectionId);
+  }
+
+  /**
+   * One page of a connection's source folder listing, for a folder-picker
+   * UI. `cursor = undefined` browses `path` fresh; pass back `nextCursor` to
+   * continue.
+   */
+  async browseConnection(
+    connectionId: string,
+    options: { path?: string; cursor?: string } = {},
+  ): Promise<ConnectionBrowsePage> {
+    if (!connectionId) throw new AetherError("connectionId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    const raw = await this._request<{
+      entries: Array<{
+        name: string;
+        path_display: string;
+        is_folder: boolean;
+        size_bytes?: number;
+        modified?: string;
+      }>;
+      next_cursor?: string;
+    }>(`/connections/${encodeURIComponent(connectionId)}/browse${query ? `?${query}` : ""}`, {
+      method: "POST",
+      body: JSON.stringify({ path: options.path ?? "", cursor: options.cursor }),
+      headers: { "Content-Type": "application/json" },
+    });
+    return {
+      entries: raw.entries.map((e) => ({
+        name: e.name,
+        pathDisplay: e.path_display,
+        isFolder: e.is_folder,
+        sizeBytes: e.size_bytes,
+        modified: e.modified,
+      })),
+      nextCursor: raw.next_cursor,
+    };
+  }
+
+  /**
+   * Replace a connection's synced-path scope outright (not a merge — send
+   * the full intended set; an empty array means the whole account). Returns
+   * the normalized list actually stored.
+   */
+  async updateSelection(
+    connectionId: string,
+    selectedPaths: string[],
+  ): Promise<string[]> {
+    if (!connectionId) throw new AetherError("connectionId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    const raw = await this._request<{
+      connection_id: string;
+      selected_paths: string[];
+    }>(`/connections/${encodeURIComponent(connectionId)}/selection${query ? `?${query}` : ""}`, {
+      method: "PUT",
+      body: JSON.stringify({ selected_paths: selectedPaths }),
+      headers: { "Content-Type": "application/json" },
+    });
+    return raw.selected_paths;
+  }
+
+  /**
+   * Fetch a connection's disconnect-purge receipt — the full signed proof,
+   * including every purged document id, the Merkle root, the Ed25519
+   * signature, and the node's own `verified` re-check.
+   */
+  async getPurgeReceipt(receiptId: string): Promise<ConnectionPurgeReceipt> {
+    if (!receiptId) throw new AetherError("receiptId is required");
+    const params = new URLSearchParams();
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    const raw = await this._request<RawPurgeReceipt>(
+      `/connections/purge-receipts/${encodeURIComponent(receiptId)}${query ? `?${query}` : ""}`,
+    );
+    return normalizePurgeReceipt(raw);
   }
 
   /**

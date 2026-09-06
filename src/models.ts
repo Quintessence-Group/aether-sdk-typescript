@@ -153,6 +153,22 @@ export interface ConversationThread {
 }
 
 /**
+ * Result of a whole-thread lifecycle mutation — {@link AetherClient.restoreThread},
+ * {@link AetherClient.setThreadAcl}, {@link AetherClient.moveThread}, or
+ * {@link AetherClient.deleteThread}.
+ */
+export interface ThreadLifecycleResult {
+  /**
+   * The applied action: `"tombstoned"`, `"restored"`, `"acl_updated"`,
+   * `"hard_deleted"`, or `"moved"`.
+   */
+  status: string;
+  thread_id: string;
+  /** Number of turns whose canonical marker (tombstone / ACL / partition) was rewritten. */
+  turns: number;
+}
+
+/**
  * How a search result was actually used, reported via
  * {@link AetherClient.sendSearchFeedback}: `"used"` (informed the answer),
  * `"cited"` (quoted/referenced directly), or `"ignored"` (retrieved but unused).
@@ -641,4 +657,133 @@ export interface SchemaOps {
   declareFields(fields: FieldSchemaInput[]): Promise<FieldSchema[]>;
   listFields(): Promise<FieldSchema[]>;
   deleteField(name: string): Promise<FieldSchema[]>;
+}
+
+// ── Connections + connect sessions ────
+
+/** The response of `client.createConnectSession(...)`. */
+export interface ConnectSession {
+  /** Opaque, single-use. Embed the whole `connectUrl` in your UI rather than
+   * reconstructing it. */
+  sessionToken: string;
+  /** Open this in the end user's browser to start the hosted OAuth flow. */
+  connectUrl: string;
+  /** Returned exactly once. Store it server-side and use it with
+   * {@link verifyConnectRedirectSignature} when the flow completes. */
+  clientSecret: string;
+  expiresAt: string;
+}
+
+/** Options for `client.createConnectSession(...)`. */
+export interface CreateConnectSessionOptions {
+  /** Defaults to `"dropbox"`, the only provider today. */
+  provider?: string;
+  externalUserId: string;
+  returnUrl: string;
+  /** Override the partition this connection will sync into. Omit to use the
+   * pinned mapping (`externalUserId` names the partition). */
+  targetPartition?: string;
+}
+
+/** One connection — a developer's own source (mode A) or one end user's
+ * (mode B). Never carries credential material. */
+export interface Connection {
+  connectionId: string;
+  provider: string;
+  ownerType: "tenant" | "external_user";
+  ownerId?: string;
+  providerAccountId: string;
+  accountDisplayName?: string;
+  /** `undefined` for mode A (the tenant's default partition); the end
+   * user's id for mode B. */
+  targetPartition?: string;
+  status: string;
+  grantedScopes: string[];
+  createdAt: string;
+  lastSyncAt?: string;
+  lastError?: string;
+  filesSynced: number;
+  filesSkipped: number;
+  filesDeleted: number;
+  selectedPaths: string[];
+  purgeState: "not_started" | "in_flight" | "complete";
+  purgeReceiptId?: string;
+  credentialDeleted: boolean;
+  /**
+   * True when this row's provider-side identity was withheld because the call
+   * was not scoped to the connection's partition: `providerAccountId` is then
+   * `""` and `accountDisplayName` is absent. Every other field is real. Name
+   * `partition` on the call — the same scope the by-id routes require — to get
+   * the identity. Always `false` for mode-A connections and on by-id reads.
+   */
+  identityRedacted: boolean;
+}
+
+/** Filters for `client.listConnections(...)`. */
+export interface ListConnectionsOptions {
+  ownerType?: "tenant" | "external_user";
+  ownerId?: string;
+  /** Defaults to `true` — keep disconnected connections as audit rows. */
+  includePurged?: boolean;
+}
+
+/** Summary of what `client.deleteConnection(...)` destroyed. `undefined`
+ * only when the connection did not exist (the idempotent no-op). */
+export interface PurgeSummary {
+  receiptId: string;
+  documentsPurged: number;
+  merkleRoot: string;
+  completedAt: string;
+  signerNodeId: string;
+}
+
+/** The result of `client.deleteConnection(...)`. */
+export interface DisconnectResult {
+  connectionId: string;
+  status: string;
+  purge?: PurgeSummary;
+}
+
+/** The full signed proof `client.getPurgeReceipt(...)` returns — enough to
+ * re-verify offline with {@link verifyPurgeReceipt}. */
+export interface ConnectionPurgeReceipt {
+  version: string;
+  receiptId: string;
+  tenantId: string;
+  connectionId: string;
+  provider: string;
+  owner: string;
+  providerAccountId: string;
+  documentsPurged: number;
+  documentsFailed: number;
+  merkleRoot: string;
+  merkleLeafCount: number;
+  purgedDocumentIds: string[];
+  partitionsTouched: string[];
+  defaultPartitionTouched: boolean;
+  credentialRevocation: string;
+  credentialDeleted: boolean;
+  startedAt: string;
+  completedAt: string;
+  signerNodeId: string;
+  signerPublicKey: string;
+  signature: string;
+  /** The node's own re-verification at read time. */
+  verified: boolean;
+}
+
+/** One entry in a `client.browseConnection(...)` page. */
+export interface ConnectionBrowseEntry {
+  name: string;
+  pathDisplay: string;
+  isFolder: boolean;
+  sizeBytes?: number;
+  modified?: string;
+}
+
+/** One page of `client.browseConnection(...)`. */
+export interface ConnectionBrowsePage {
+  entries: ConnectionBrowseEntry[];
+  /** Present iff another page exists; pass back as the next call's `cursor`. */
+  nextCursor?: string;
 }

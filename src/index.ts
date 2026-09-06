@@ -1,4 +1,9 @@
-export { AetherClient, INGEST_CONTENT_TYPES, resolveContentType } from "./client.js";
+export {
+  AetherClient,
+  INGEST_CONTENT_TYPES,
+  resolveContentType,
+  verifyConnectRedirectSignature,
+} from "./client.js";
 export type { AetherClientOptions } from "./client.js";
 export { Memory, Thread } from "./memory.js";
 export type {
@@ -31,6 +36,8 @@ export {
   TenantPausedError,
   PartitionRequiredError,
   PrincipalPinMismatchError,
+  SessionInvalidError,
+  PartitionMismatchError,
   aetherApiErrorFromResponse,
 } from "./errors.js";
 export type { AetherErrorBody } from "./errors.js";
@@ -51,6 +58,7 @@ export type {
   MediaMemoryRecord,
   ConversationThread,
   ThreadAppendInput,
+  ThreadLifecycleResult,
   ThreadReadOptions,
   SearchResult,
   SearchFeedbackSignal,
@@ -74,6 +82,15 @@ export type {
   QueryGroup,
   AggregateResult,
   SchemaOps,
+  ConnectSession,
+  CreateConnectSessionOptions,
+  Connection,
+  ListConnectionsOptions,
+  PurgeSummary,
+  DisconnectResult,
+  ConnectionPurgeReceipt,
+  ConnectionBrowseEntry,
+  ConnectionBrowsePage,
 } from "./models.js";
 export { formatContext, DEFAULT_TEMPLATE } from "./rag.js";
 export type { FormatContextOptions, FormatContextResult } from "./rag.js";
