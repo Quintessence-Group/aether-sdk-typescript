@@ -3,6 +3,48 @@
 All notable changes to `@aether-ai/sdk` are documented here. This project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.6.0
+
+Additive release — no breaking changes. Existing code continues to work
+unchanged; every new method, type, and error is opt-in.
+
+### Added
+
+- **Thread lifecycle.** Whole-thread operations on the raw client —
+  `client.restoreThread(threadId)`, `client.setThreadAcl(threadId, aclReaders)`,
+  `client.moveThread(threadId, { expectPartition, toPartition })`, and
+  `client.deleteThread(threadId, { hard })` — each resolving to a uniform
+  `ThreadLifecycleResult` (`status`, `thread_id`, `turns`). The
+  `memory.thread(threadId)` facade gains the same operations as `restore()`,
+  `setAcl(readers)`, `move(toPartition)`, and `delete(hard)`. Every operation
+  sends an `Idempotency-Key` (pass `idempotencyKey` to make cross-process
+  retries safe). Turn text is never rewritten — an edit appends a correction
+  turn — and deletes are soft by default; `hard: true` is an irreversible
+  erasure.
+- **Connections API + connect sessions.** Attach an end user's external account
+  (Dropbox today) to their partition from your own backend, without the portal:
+  - `client.createConnectSession({ externalUserId, returnUrl, provider?, targetPartition? })`
+    mints a hosted OAuth entry point and returns a `ConnectSession`
+    (`session_token`, `connect_url`, a one-time `client_secret`, `expires_at`).
+  - `verifyConnectRedirectSignature(clientSecret, { session, status, connectionId, sig })`
+    verifies the signed redirect back to your `returnUrl` entirely offline
+    (HMAC-SHA256 over `session|status|connection_id`, keyed by
+    `SHA-256(client_secret)`). No network call, no new dependencies.
+  - `client.listConnections(options?)`, `client.getConnection(id)`,
+    `client.resyncConnection(id)`, `client.browseConnection(id, { path?, cursor? })`,
+    and `client.updateSelection(id, selectedPaths)` manage a connection and its
+    sync scope. `client.deleteConnection(id)` purges the synced content and
+    returns a `DisconnectResult`; the signed purge receipt is fetchable with
+    `client.getPurgeReceipt(receiptId)` (`ConnectionPurgeReceipt`).
+  - New types: `ConnectSession`, `CreateConnectSessionOptions`, `Connection`,
+    `ListConnectionsOptions`, `DisconnectResult`, `PurgeSummary`,
+    `ConnectionPurgeReceipt`.
+- **Typed connect-session errors.** `SessionInvalidError` (HTTP 400,
+  `code: "session_invalid"` — the session token is unknown, already used, or
+  expired; mint a new session instead of retrying) and `PartitionMismatchError`
+  (HTTP 400, `code: "partition_mismatch"` — the handle's partition disagrees
+  with where the session would resolve). Neither is retryable.
+
 ## 0.5.0
 
 Additive release — no breaking changes. Existing code continues to work
