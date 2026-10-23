@@ -90,6 +90,12 @@ jobs:
           else
             NPM_TAG=latest
           fi
+          PUBLISHED_HEAD=$(npm view "@aether-ai/sdk@${PKG_VERSION}" gitHead --prefer-online --registry=https://registry.npmjs.org 2>/dev/null || true)
+          if [ -n "$PUBLISHED_HEAD" ]; then
+            test "$PUBLISHED_HEAD" = "$(git rev-parse HEAD)" || { echo "::error::Published version belongs to a different source commit"; exit 1; }
+            echo "Version $PKG_VERSION is already published from this release commit; verifying its installation."
+            exit 0
+          fi
           echo "Publishing $PKG_VERSION to dist-tag '$NPM_TAG'"
           if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
             echo "Auth: NPM_TOKEN (classic token publish, no provenance)"
@@ -101,6 +107,10 @@ jobs:
 
       - name: Install smoke from npm
         working-directory: /tmp
+        env:
+          NODE_AUTH_TOKEN: ""
+          NPM_CONFIG_USERCONFIG: /dev/null
+          NPM_CONFIG_PREFER_ONLINE: "true"
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" == v* ]] || { echo "::error::Select an existing v<version> release tag"; exit 1; }
@@ -108,7 +118,7 @@ jobs:
           mkdir -p /tmp/aether-ts-smoke && cd /tmp/aether-ts-smoke
           npm init -y
           for attempt in 1 2 3 4 5; do
-            if npm install "@aether-ai/sdk@${TAG_VERSION}"; then break; fi
+            if npm install "@aether-ai/sdk@${TAG_VERSION}" --prefer-online --registry=https://registry.npmjs.org; then break; fi
             [ "$attempt" = "5" ] && exit 1
             sleep 30
           done
