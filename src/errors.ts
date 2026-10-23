@@ -130,6 +130,27 @@ export class PartitionMismatchError extends AetherApiError {
 }
 
 /**
+ * Thrown when a conditional memory-file write or delete loses a race (HTTP
+ * 412, `code: "memory_file_version_conflict"`): the `expectedVersion` you
+ * sent is no longer the file's current version, or `create` was used on a
+ * file that already exists. `currentVersion` is the file's version now
+ * (`null` when the file does not exist). Re-read the file, re-apply your edit
+ * and write again with `expectedVersion: file.version`. Not retryable as-is.
+ */
+export class VersionConflictError extends AetherApiError {
+  /** The file's current version, or `null` when no live file exists. */
+  readonly currentVersion: number | null;
+
+  constructor(status: number, statusText: string, body: AetherErrorBody) {
+    super(status, statusText, body);
+    this.name = "VersionConflictError";
+    const current = (body as unknown as Record<string, unknown>).current_version;
+    this.currentVersion =
+      typeof current === "number" && Number.isInteger(current) ? current : null;
+  }
+}
+
+/**
  * Build the most-specific `AetherApiError` subclass for the given response.
  * The factory inspects the structured `code` field (Phase 8 / ADR-015 wire
  * shape); unknown codes fall back to the base `AetherApiError`.
@@ -159,6 +180,9 @@ export function aetherApiErrorFromResponse(
   }
   if (status === 400 && body.code === "partition_mismatch") {
     return new PartitionMismatchError(status, statusText, body);
+  }
+  if (status === 412 && body.code === "memory_file_version_conflict") {
+    return new VersionConflictError(status, statusText, body);
   }
   return new AetherApiError(status, statusText, body);
 }

@@ -1,7 +1,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { AetherClient, validateThreadId, type AetherClientOptions } from "./client.js";
+import {
+  AetherClient,
+  hydrateDocumentText,
+  validateThreadId,
+  type AetherClientOptions,
+} from "./client.js";
 import { AetherError } from "./errors.js";
+import { MemoryFiles } from "./memory-files.js";
 import type {
   DocumentRecord,
   Metadata,
@@ -80,6 +86,13 @@ export type MemoryOptions = AetherClientOptions & {
    * Default: `false`.
    */
   extractFacts?: boolean;
+  /**
+   * Default for {@link Memory.remember}'s background summary request
+   * (overridable per call via `remember`'s `options.summarize`). `true` asks
+   * for a summary of every remembered text, `false` explicitly opts out;
+   * leave it unset to follow the tenant's default.
+   */
+  summarize?: boolean;
   /**
    * Injectable clock returning "now", used by the recency-decay path so tests
    * are deterministic. Defaults to `() => new Date()` (system UTC time).
@@ -542,7 +555,15 @@ export class Memory {
   private readonly client: AetherClient;
   private readonly halfLifeDays: number;
   private readonly extractFacts: boolean;
+  private readonly summarize?: boolean;
   private readonly now: () => Date;
+
+  /**
+   * This entity's markdown memory files: named, versioned documents read
+   * whole, by section or by page, and edited with version preconditions or
+   * section-aware appends. See {@link MemoryFiles}.
+   */
+  readonly files: MemoryFiles;
 
   /**
    * @param entityId - The entity to scope all memories to (1–256 chars, non-empty).
@@ -564,7 +585,9 @@ export class Memory {
     this.client = options.client ?? new AetherClient(options);
     this.halfLifeDays = options.halfLifeDays ?? 30;
     this.extractFacts = options.extractFacts ?? false;
+    this.summarize = options.summarize;
     this.now = options.now ?? (() => new Date());
+    this.files = new MemoryFiles(this.client, entityId);
   }
 
   /** Bind an ordered conversation helper to this Memory's entity scope. */
@@ -594,7 +617,8 @@ export class Memory {
    * @param metadata - Optional structured metadata. Values must be strings,
    *   numbers, or booleans.
    * @param options - Optional per-call settings. `options.extract` overrides the
-   *   Memory's `extractFacts` default for this call.
+   *   Memory's `extractFacts` default for this call; `options.summarize`
+   *   overrides its `summarize` default (unset on both → the tenant default).
    * @returns A {@link MemoryItem} built from the returned document record.
    * @throws {AetherError} If `text` is empty/whitespace, or a metadata key is
    *   empty / contains `:` or `,`, or a value contains a comma (no HTTP call is
@@ -605,13 +629,13 @@ export class Memory {
   async remember(
     text: string,
     metadata?: Metadata,
-    options?: { extract?: boolean },
+    options?: { extract?: boolean; summarize?: boolean },
   ): Promise<MemoryItem>;
   async remember(input: MediaRememberInput): Promise<MemoryItem>;
   async remember(
     textOrMedia: string | MediaRememberInput,
     metadata?: Metadata,
-    options?: { extract?: boolean },
+    options?: { extract?: boolean; summarize?: boolean },
   ): Promise<MemoryItem> {
     if (typeof textOrMedia !== "string") {
       const input = textOrMedia;
@@ -673,6 +697,9 @@ export class Memory {
       tags: tags.length > 0 ? tags : undefined,
       metadata,
       extractFacts: extract || undefined,
+      // Per-call `summarize` wins, else the Memory's default; unset on both
+      // sends nothing, so the tenant default applies.
+      summarize: options?.summarize ?? this.summarize,
     });
     return {
       id: record.doc_id,
@@ -778,12 +805,14 @@ export class Memory {
   /**
    * Chronological view of the entity's memories, **newest first**.
    *
-   * Lists the entity's documents (1 call), then downloads each memory's text
-   * (parallelized) to populate {@link MemoryItem.text}.
+   * Lists the entity's documents (1 call), then reads each memory's text
+   * (parallelized) to populate {@link MemoryItem.text}: text-like documents are
+   * downloaded, other types (PDF, Office, …) are read through
+   * `client.getText`, and media memories use their caption/transcript.
    *
-   * > **Cost note:** `list` is **1 + N** calls (one listing + one content download
-   * > per item). `limit` bounds N. Callers who only need metadata can drop to the
-   * > raw `client.list({ entityId })`.
+   * > **Cost note:** `list` is **1 + N** calls (one listing + one content read
+   * > per non-media item). `limit` bounds N. Callers who only need metadata can
+   * > drop to the raw `client.list({ entityId })`.
    *
    * @param options - List options.
    * @returns Up to `limit` {@link MemoryItem}s, newest first, with text populated.
@@ -800,10 +829,13 @@ export class Memory {
       limit,
     });
     const capped = documents.slice(0, limit);
+    // Media records carry their caption/transcript; everything else is read
+    // by content type (text-like → download, otherwise /text, falling back
+    // to "").
     const texts = await Promise.all(capped.map((r) =>
       r.modality && r.derived_text !== undefined
         ? Promise.resolve(r.derived_text)
-        : this.client.downloadText(r.doc_id),
+        : hydrateDocumentText(this.client, r.doc_id, r.content_type, r.derived_text ?? ""),
     ));
     return capped.map((r, i) => ({
       id: r.doc_id,

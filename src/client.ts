@@ -25,16 +25,27 @@ import type {
   CreateConnectSessionOptions,
   DisconnectResult,
   DocumentRecord,
+  DocumentSummary,
+  DocumentText,
   EntityBackfillReport,
   FieldSchema,
   FieldSchemaInput,
+  GetTextOptions,
+  GrepMemoryFilesOptions,
   GroundingReceipt,
   ListConnectionsOptions,
+  ListMemoryFilesOptions,
+  MemoryFile,
+  MemoryFileInfo,
+  MemoryFilePage,
+  MemoryFileWriteResult,
+  MemoryGrepResult,
   QueryGroup,
   QueryPage,
   SchemaOps,
   IngestResult,
   IsolationCheck,
+  JobStatus,
   Metadata,
   MetadataFilter,
   MediaMemoryRecord,
@@ -413,6 +424,203 @@ export function verifyConnectRedirectSignature(
   return timingSafeEqual(expectedBuf, actualBuf);
 }
 
+/** Largest page {@link AetherClient.getText} can return (1 MiB). */
+const MAX_TEXT_PAGE_BYTES = 1_048_576;
+
+const NON_TEXT_TEXT_TYPES = new Set([
+  "text/html",
+  "text/csv",
+  "text/tab-separated-values",
+  "text/rtf",
+]);
+const TEXT_LIKE_APPLICATION_TYPES = new Set([
+  "application/json",
+  "application/xml",
+  "application/javascript",
+  "application/typescript",
+  "application/x-yaml",
+]);
+
+/**
+ * Whether a document of this content type can be read by decoding its
+ * original bytes as UTF-8. `text/*` (except HTML, CSV, TSV and RTF, which
+ * the server parses) and a few structured application types qualify;
+ * everything else — PDF, Office, octet-stream, a missing type — is read
+ * through {@link AetherClient.getText} instead.
+ */
+export function isTextLikeContentType(contentType: string | null | undefined): boolean {
+  const base = (contentType ?? "").split(";")[0].trim().toLowerCase();
+  if (base.startsWith("text/")) return !NON_TEXT_TEXT_TYPES.has(base);
+  return TEXT_LIKE_APPLICATION_TYPES.has(base);
+}
+
+/**
+ * Read a non-media document's text for `retrieve` / `Memory.recall` /
+ * `Memory.list`: text-like types are downloaded and decoded; any other type
+ * goes through `GET /v1/documents/{id}/text` (up to 1 MiB). When that text
+ * is unavailable (`state: "unsupported"`), or the server answers 404 (an
+ * older server, or the document vanished), `fallback` is returned. Other
+ * errors propagate.
+ *
+ * @internal Shared by the client and the Memory facade; not part of the
+ * public API.
+ */
+export async function hydrateDocumentText(
+  client: AetherClient,
+  docId: string,
+  contentType: string | null | undefined,
+  fallback: string,
+): Promise<string> {
+  if (isTextLikeContentType(contentType)) return client.downloadText(docId);
+  try {
+    const text = await client.getText(docId, { maxBytes: MAX_TEXT_PAGE_BYTES });
+    return text.state === "ready" ? text.text : fallback;
+  } catch (err) {
+    if (err instanceof AetherApiError && err.status === 404) return fallback;
+    throw err;
+  }
+}
+
+const MEMORY_FILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Check a memory-file name client-side. A valid name is 1–128 ASCII letters,
+ * digits, `.`, `_` or `-`, starts with a letter or digit, does not contain
+ * `..`, and is not exactly `grep`. Names are case-sensitive.
+ *
+ * @param name - The memory-file name to check.
+ * @throws {AetherError} If the name is invalid (no HTTP call is ever made
+ *   with an invalid name).
+ */
+export function validateMemoryFileName(name: string): void {
+  if (
+    typeof name !== "string" ||
+    !MEMORY_FILE_NAME_RE.test(name) ||
+    name.includes("..") ||
+    name === "grep"
+  ) {
+    throw new AetherError(
+      `invalid memory file name ${JSON.stringify(name)}: use 1-128 letters, digits, ` +
+        `'.', '_' or '-', starting with a letter or digit, without "..", and not "grep"`,
+    );
+  }
+}
+
+/**
+ * Parse a memory-file `ETag` header (`"7"`) into its version number. A weak
+ * `W/` prefix and the surrounding quotes are stripped; anything that is not a
+ * decimal integer yields `null`.
+ *
+ * @internal
+ */
+export function parseEtagVersion(etag: string | null | undefined): number | null {
+  if (etag == null) return null;
+  let value = etag.trim();
+  if (value.startsWith("W/")) value = value.slice(2);
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    value = value.slice(1, -1);
+  }
+  return /^\d+$/.test(value) ? Number(value) : null;
+}
+
+/**
+ * Format a version (or summary revision) as a strong entity tag for
+ * `If-Match`: the value wrapped in double quotes, e.g. `"7"`.
+ *
+ * @internal
+ */
+export function formatIfMatch(value: number | string): string {
+  return `"${value}"`;
+}
+
+/** Default the nullable memory-file fields an older server may omit. */
+function normalizeMemoryFileInfo<T extends MemoryFileInfo>(f: T): T {
+  return { ...f, partition: f.partition ?? null, author: f.author ?? null };
+}
+
+/** @internal */
+export function normalizeMemoryFilePage(page: MemoryFilePage): MemoryFilePage {
+  return {
+    files: (page.files ?? []).map(normalizeMemoryFileInfo),
+    next_cursor: page.next_cursor ?? null,
+  };
+}
+
+/** @internal */
+export function normalizeMemoryGrepResult(r: MemoryGrepResult): MemoryGrepResult {
+  return {
+    matches: (r.matches ?? []).map((m) => ({
+      ...m,
+      partition: m.partition ?? null,
+      section: m.section ?? null,
+      section_slug: m.section_slug ?? null,
+      before: m.before ?? [],
+      after: m.after ?? [],
+    })),
+    truncated: r.truncated ?? false,
+    truncated_reason: r.truncated_reason ?? null,
+    files_scanned: r.files_scanned ?? 0,
+    bytes_scanned: r.bytes_scanned ?? 0,
+  };
+}
+
+/**
+ * Normalize a memory-file read or write result: nullable fields default to
+ * `null`, `sections` to `[]`, and a body without `version` takes it from the
+ * response `ETag`.
+ *
+ * @internal
+ */
+export function normalizeMemoryFileResult<T extends MemoryFile | MemoryFileWriteResult>(
+  f: T,
+  etag: string | null,
+): T {
+  return {
+    ...normalizeMemoryFileInfo(f),
+    version: f.version ?? parseEtagVersion(etag) ?? f.version,
+    section: f.section ?? null,
+    sections: f.sections ?? [],
+    ...("content" in f ? { next_offset: f.next_offset ?? null } : {}),
+    ...("unchanged" in f ? { previous_version: f.previous_version ?? null } : {}),
+  };
+}
+
+/** Default the nullable summary fields an older server may omit. */
+function normalizeDocumentSummary(s: DocumentSummary): DocumentSummary {
+  return {
+    ...s,
+    reason: s.reason ?? null,
+    error: s.error ?? null,
+    summary_doc_id: s.summary_doc_id ?? null,
+    content: s.content ?? null,
+    revision: s.revision ?? null,
+    authored_by: s.authored_by ?? null,
+    generator: s.generator ?? null,
+    prompt_version: s.prompt_version ?? null,
+    generated_at: s.generated_at ?? null,
+    source_cid: s.source_cid ?? null,
+    stale: s.stale ?? false,
+    truncated_input: s.truncated_input ?? false,
+  };
+}
+
+/** @internal Options for {@link AetherClient.memoryFileRequest}. */
+export interface MemoryFileRequestInit {
+  /** Query params; `undefined` values are dropped. */
+  query?: Record<string, string | number | boolean | undefined>;
+  body?: string;
+  contentType?: string;
+  /** `If-Match` value, already formatted. */
+  ifMatch?: string;
+  /** `If-None-Match` value. */
+  ifNoneMatch?: string;
+  /**
+   * Send an `Idempotency-Key`: the given string, or a fresh key minted once
+   * for this call (reused across its retries) when `true` or empty.
+   */
+  idempotencyKey?: string | true;
+}
+
 export class AetherClient {
   private readonly baseUrl: string;
   private readonly headers: Record<string, string>;
@@ -668,6 +876,18 @@ export class AetherClient {
     };
   }
 
+  /**
+   * Add the `summarize` insert param when the caller chose explicitly: `true`
+   * and `false` are both sent (an explicit `false` overrides the tenant
+   * default); `undefined` sends nothing.
+   */
+  private static setSummarizeParam(
+    params: URLSearchParams,
+    summarize: boolean | undefined,
+  ): void {
+    if (summarize !== undefined) params.set("summarize", String(summarize));
+  }
+
   private static setJsonParam(
     params: URLSearchParams,
     key: string,
@@ -823,6 +1043,19 @@ export class AetherClient {
     path: string,
     init?: RequestInit,
   ): Promise<T> {
+    const response = await this._requestResponse(path, init);
+    return (await response.json()) as T;
+  }
+
+  /**
+   * Send a request through the retrying transport and return the successful
+   * response (headers included); a non-2xx response is thrown as the typed
+   * API error.
+   */
+  private async _requestResponse(
+    path: string,
+    init?: RequestInit,
+  ): Promise<Response> {
     // Data routes are rewritten under the /v1 API version prefix here, at the
     // transport boundary, so every caller (including the Memory facade)
     // versions its paths in one place. An asPrincipal() handle's assertion
@@ -841,7 +1074,51 @@ export class AetherClient {
       throw aetherApiErrorFromResponse(response.status, response.statusText, body);
     }
 
-    return (await response.json()) as T;
+    return response;
+  }
+
+  /**
+   * Transport hook for the {@link MemoryFiles} facade (`/v1/memory/files/*`).
+   *
+   * Adds this client's partition to `query`, sends the conditional-request
+   * and idempotency headers, and returns the parsed JSON body together with
+   * the response `ETag`. Reuses the standard retry/error/timeout transport:
+   * a retried attempt carries the same `Idempotency-Key`. **Not part of the
+   * public API.**
+   *
+   * @internal
+   */
+  async memoryFileRequest<T>(
+    method: string,
+    path: string,
+    init: MemoryFileRequestInit = {},
+  ): Promise<{ data: T; etag: string | null }> {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(init.query ?? {})) {
+      if (v !== undefined) params.set(k, String(v));
+    }
+    this.applyPartitionParam(params);
+    const headers: Record<string, string> = {};
+    if (init.contentType) headers["Content-Type"] = init.contentType;
+    if (init.ifMatch !== undefined) headers["If-Match"] = init.ifMatch;
+    if (init.ifNoneMatch !== undefined) headers["If-None-Match"] = init.ifNoneMatch;
+    if (init.idempotencyKey !== undefined) {
+      // Minted once here, so every retry of this call reuses the same key.
+      headers["Idempotency-Key"] =
+        init.idempotencyKey === true || init.idempotencyKey === ""
+          ? randomUUID()
+          : init.idempotencyKey;
+    }
+    const qs = params.toString();
+    const response = await this._requestResponse(`${path}${qs ? `?${qs}` : ""}`, {
+      method,
+      headers,
+      body: init.body,
+    });
+    return {
+      data: (await response.json()) as T,
+      etag: response.headers.get("ETag"),
+    };
   }
 
   private async _requestRaw(
@@ -930,6 +1207,10 @@ export class AetherClient {
    *   Omit to leave the document unlabeled — readable tenant-wide, the default. An
    *   explicit empty array quarantines the document to admin-role keys only.
    * @param options.chunking - Chunking configuration for document splitting.
+   * @param options.summarize - Generate a summary of the document in the
+   *   background after it is stored (`true`), or explicitly not (`false`),
+   *   overriding the tenant default; omit to use the tenant default. The
+   *   returned record's `summary` reports `"pending"` or `"skipped"`.
    * @returns The created document record.
    * @throws {AetherError} If filename is empty or chunking config is invalid.
    * @throws {AetherApiError} On non-2xx API response.
@@ -946,6 +1227,7 @@ export class AetherClient {
       source?: string;
       aclReaders?: string[];
       chunking?: ChunkingConfig;
+      summarize?: boolean;
     },
   ): Promise<DocumentRecord> {
     if (!options.filename) throw new AetherError("filename is required");
@@ -978,6 +1260,7 @@ export class AetherClient {
     if (options.chunking?.overlap !== undefined) {
       params.set("overlap", options.chunking.overlap.toString());
     }
+    AetherClient.setSummarizeParam(params, options.summarize);
     const record = await this._request<DocumentRecord>(`/documents?${params}`, {
       method: "POST",
       body: data as unknown as BodyInit,
@@ -1456,6 +1739,7 @@ export class AetherClient {
    * @param options.source - Origin/source of this document (e.g. `"slack"`, `"notion"`), for filtering.
    * @param options.aclReaders - Read-ACL for the document (see {@link insert}
    *   for the semantics).
+   * @param options.summarize - Request a background summary (see {@link insert}).
    * @returns The created document record.
    * @throws {AetherApiError} On non-2xx API response.
    * @throws {AetherNetworkError} On connection or timeout failure.
@@ -1470,6 +1754,7 @@ export class AetherClient {
       entityId?: string;
       source?: string;
       aclReaders?: string[];
+      summarize?: boolean;
     },
   ): Promise<DocumentRecord> {
     const filename = options?.filename ?? "upload.bin";
@@ -1490,6 +1775,7 @@ export class AetherClient {
     AetherClient.setJsonParam(params, "metadata", options?.metadata);
     AetherClient.setAclReadersParam(params, options?.aclReaders);
     this.applyPartitionParam(params);
+    AetherClient.setSummarizeParam(params, options?.summarize);
     const record = await this._requestNoRetry<DocumentRecord>(`/documents?${params}`, {
       method: "POST",
       body: stream,
@@ -1513,6 +1799,8 @@ export class AetherClient {
    * @param options.aclReaders - Read-ACL for the document (see {@link insert}
    *   for the semantics).
    * @param options.chunking - Chunking configuration for document splitting.
+   * @param options.extractFacts - Distill the text into atomic facts server-side.
+   * @param options.summarize - Request a background summary (see {@link insert}).
    * @returns The created document record.
    * @throws {AetherError} If text is empty or chunking config is invalid.
    * @throws {AetherApiError} On non-2xx API response.
@@ -1529,6 +1817,7 @@ export class AetherClient {
       aclReaders?: string[];
       chunking?: ChunkingConfig;
       extractFacts?: boolean;
+      summarize?: boolean;
     },
   ): Promise<DocumentRecord> {
     if (!text) throw new AetherError("text is required");
@@ -1564,6 +1853,7 @@ export class AetherClient {
     if (options?.chunking?.overlap !== undefined) {
       params.set("overlap", options.chunking.overlap.toString());
     }
+    AetherClient.setSummarizeParam(params, options?.summarize);
     const record = await this._request<DocumentRecord>(`/documents?${params}`, {
       method: "POST",
       body: new TextEncoder().encode(text) as unknown as BodyInit,
@@ -2098,11 +2388,223 @@ export class AetherClient {
   }
 
   /**
+   * Read a document's text: the original for text documents, the caption or
+   * transcript for media, and text rebuilt from the parsed passages for PDF,
+   * Office and other parsed types.
+   *
+   * The result is paged: pass `next_offset` back as `offset` while
+   * `truncated`. A `section` narrows the text to one markdown section (by
+   * heading text or slug); `outline: true` returns only the outline. A
+   * document with no readable text comes back with `state: "unsupported"`.
+   *
+   * On a partition handle the partition is sent as a guard: a doc id that
+   * lives in a different partition returns the same 404 as a nonexistent id.
+   *
+   * @param docId - ID of the document.
+   * @param options - Section, outline and paging options.
+   * @returns The {@link DocumentText} page.
+   * @throws {AetherError} If docId is empty.
+   * @throws {AetherApiError} On non-2xx API response (404 not found or no
+   *   matching section, 409 ambiguous section, 400 invalid options).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async getText(docId: string, options?: GetTextOptions): Promise<DocumentText> {
+    if (!docId) throw new AetherError("docId is required");
+    const params = new URLSearchParams();
+    if (options?.section !== undefined) params.set("section", options.section);
+    if (options?.outline) params.set("outline", "true");
+    if (options?.offset !== undefined) params.set("offset", String(options.offset));
+    if (options?.maxBytes !== undefined) params.set("max_bytes", String(options.maxBytes));
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    return this._request<DocumentText>(
+      `/documents/${encodeURIComponent(docId)}/text${query ? `?${query}` : ""}`,
+    );
+  }
+
+  // ── Document summaries ────────────────────────────────────────────
+
+  /**
+   * Read a document's summary. Always answers with a `state` for a document
+   * you can see: `none` (nothing stored or pending), `pending`, `ready`,
+   * `failed`, `skipped` (by policy) or `unsupported` (this kind of document
+   * is never summarized). `content` is the stored summary whatever the
+   * state, and `stale` is `true` when the document changed after it was
+   * written.
+   *
+   * On a partition handle the partition is sent as a guard: a doc id that
+   * lives in a different partition returns the same 404 as a nonexistent id.
+   *
+   * @param docId - ID of the document.
+   * @returns The {@link DocumentSummary}.
+   * @throws {AetherError} If docId is empty.
+   * @throws {AetherApiError} On non-2xx API response (404 when the document
+   *   is not visible, or `feature_not_enabled` when summaries are not
+   *   enabled on the server).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async getSummary(docId: string): Promise<DocumentSummary> {
+    if (!docId) throw new AetherError("docId is required");
+    const summary = await this._request<DocumentSummary>(this.summaryPath(docId));
+    return normalizeDocumentSummary(summary);
+  }
+
+  /**
+   * Write your own summary for a document (1–16 KiB of markdown). It is
+   * stored as user-authored, replaces any stored summary, and is never
+   * overwritten by a regeneration unless that is forced.
+   *
+   * @param docId - ID of the document.
+   * @param content - The summary markdown.
+   * @param options - Write options.
+   * @param options.expectedRevision - Write only if this is still the stored
+   *   summary's `revision` (sent as `If-Match`); otherwise the server answers
+   *   412 `summary_revision_conflict`.
+   * @returns The stored {@link DocumentSummary} (`state: "ready"`).
+   * @throws {AetherError} If docId is empty or `expectedRevision` is empty.
+   * @throws {AetherApiError} On non-2xx API response (412
+   *   `summary_revision_conflict`, 413 `summary_too_large`, 422
+   *   `summary_unsupported`, …).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async putSummary(
+    docId: string,
+    content: string,
+    options?: { expectedRevision?: string },
+  ): Promise<DocumentSummary> {
+    if (!docId) throw new AetherError("docId is required");
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (options?.expectedRevision !== undefined) {
+      if (!options.expectedRevision) {
+        throw new AetherError("expectedRevision must be non-empty");
+      }
+      headers["If-Match"] = formatIfMatch(options.expectedRevision);
+    }
+    const summary = await this._request<DocumentSummary>(this.summaryPath(docId), {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ content }),
+    });
+    return normalizeDocumentSummary(summary);
+  }
+
+  /**
+   * Queue a fresh summary of a document. Joins a generation that is already
+   * pending. Poll {@link getSummary} for the outcome.
+   *
+   * @param docId - ID of the document.
+   * @param options - Regeneration options.
+   * @param options.force - Also replace a user-authored summary. Without it a
+   *   user-authored summary makes the server answer 409
+   *   `summary_user_authored`.
+   * @returns The {@link DocumentSummary} with `state: "pending"`; `content`
+   *   shows any summary stored so far.
+   * @throws {AetherError} If docId is empty.
+   * @throws {AetherApiError} On non-2xx API response (409
+   *   `summary_user_authored`, 422 `summarizer_not_configured`, …).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async regenerateSummary(
+    docId: string,
+    options?: { force?: boolean },
+  ): Promise<DocumentSummary> {
+    if (!docId) throw new AetherError("docId is required");
+    const summary = await this._request<DocumentSummary>(
+      this.summaryPath(docId, options?.force === true),
+      { method: "POST" },
+    );
+    return normalizeDocumentSummary(summary);
+  }
+
+  private summaryPath(docId: string, force = false): string {
+    const params = new URLSearchParams();
+    if (force) params.set("force", "true");
+    this.applyPartitionParam(params);
+    const query = params.toString();
+    return `/documents/${encodeURIComponent(docId)}/summary${query ? `?${query}` : ""}`;
+  }
+
+  // ── Memory files (cross-entity) ───────────────────────────────────
+
+  /**
+   * List current memory files across entities — for example every file of
+   * every entity whose id starts with `entityPrefix`. Use
+   * {@link Memory.files} for one entity's files.
+   *
+   * Ordered by partition, entity id and name. Under a multi-tenant key, call
+   * it on a partition handle.
+   *
+   * @param options - Filters and paging.
+   * @returns One {@link MemoryFilePage}; pass `next_cursor` back as `cursor`
+   *   for the next page.
+   * @throws {AetherError} If both `entityId` and `entityPrefix` are set.
+   * @throws {AetherApiError} On non-2xx API response.
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async listMemoryFiles(options: ListMemoryFilesOptions = {}): Promise<MemoryFilePage> {
+    if (options.entityId && options.entityPrefix) {
+      throw new AetherError("entityId and entityPrefix are mutually exclusive");
+    }
+    const { data } = await this.memoryFileRequest<MemoryFilePage>("GET", "/memory/files", {
+      query: {
+        entity_id: options.entityId || undefined,
+        entity_prefix: options.entityPrefix || undefined,
+        prefix: options.prefix || undefined,
+        limit: options.limit,
+        cursor: options.cursor || undefined,
+      },
+    });
+    return normalizeMemoryFilePage(data);
+  }
+
+  /**
+   * Search the current version of memory files line by line, across
+   * entities. Each matching line yields one match (with optional context
+   * lines); the scan stops at `maxMatches` or a server-side budget and then
+   * reports `truncated`.
+   *
+   * @param pattern - A literal substring, or a regular expression with
+   *   `regex: true` (linear-time syntax: no back-references or look-around).
+   * @param options - Scope and matching options.
+   * @returns The {@link MemoryGrepResult}.
+   * @throws {AetherError} If `pattern` is empty, or both `entityId` and
+   *   `entityPrefix` are set.
+   * @throws {AetherApiError} On non-2xx API response (400 `invalid_pattern`, …).
+   * @throws {AetherNetworkError} On connection or timeout failure.
+   */
+  async grepMemoryFiles(
+    pattern: string,
+    options: GrepMemoryFilesOptions = {},
+  ): Promise<MemoryGrepResult> {
+    if (!pattern) throw new AetherError("pattern must be non-empty");
+    if (options.entityId && options.entityPrefix) {
+      throw new AetherError("entityId and entityPrefix are mutually exclusive");
+    }
+    const body: Record<string, unknown> = {};
+    if (options.entityId) body.entity_id = options.entityId;
+    if (options.entityPrefix) body.entity_prefix = options.entityPrefix;
+    body.pattern = pattern;
+    body.regex = options.regex ?? false;
+    body.ignore_case = options.ignoreCase ?? false;
+    if (options.files !== undefined) body.files = options.files;
+    body.context = options.context ?? 0;
+    body.max_matches = options.maxMatches ?? 100;
+    const { data } = await this.memoryFileRequest<MemoryGrepResult>(
+      "POST",
+      "/memory/files/grep",
+      { body: JSON.stringify(body), contentType: "application/json" },
+    );
+    return normalizeMemoryGrepResult(data);
+  }
+
+  /**
    * Search and return results with document content included.
    *
-   * Combines {@link search} + {@link downloadText} into a single call for RAG workflows.
-   * Results are deduplicated by `doc_id` (closest match wins).
-   * Uses server-side `include_content` when available, falling back to per-doc downloads.
+   * Combines {@link search} with a per-document text read into a single call
+   * for RAG workflows. Results are deduplicated by `doc_id` (closest match
+   * wins). Text-like documents are downloaded and decoded; other types (PDF,
+   * Office, HTML, CSV, …) are read through {@link getText}, falling back to the
+   * matched passage; media hits use their caption/transcript passage.
    *
    * @param query - Natural-language search query.
    * @param k - Maximum number of results to return. Defaults to `5`.
@@ -2199,15 +2701,19 @@ export class AetherClient {
       });
     }
 
-    // Only text hits without inline content need a binary download + UTF-8
-    // decode. Never put a media doc id in this list.
+    // Non-media hits without inline content are hydrated by content type:
+    // text-like types are downloaded and decoded, anything else (PDF, Office,
+    // …) is read through /text so binary bytes are never decoded as UTF-8.
+    // Never put a media doc id in this list.
     const needsDownload = unique.filter(
       (r) => r.content == null && !r.modality,
     );
     const contentMap = new Map<string, string>();
     if (needsDownload.length > 0) {
       const downloaded = await Promise.all(
-        needsDownload.map((r) => this.downloadText(r.doc_id)),
+        needsDownload.map((r) =>
+          hydrateDocumentText(this, r.doc_id, r.content_type, r.passage ?? ""),
+        ),
       );
       needsDownload.forEach((r, i) => contentMap.set(r.doc_id, downloaded[i]));
     }
@@ -3085,6 +3591,8 @@ export class AetherClient {
    * @param options.aclReaders - Read-ACL for the document (see {@link insert}
    *   for the semantics).
    * @param options.chunking - Chunking configuration for document splitting.
+   * @param options.summarize - Request a background summary once the job
+   *   completes (see {@link insert}); the job status reports `summary_state`.
    * @returns An object with the `job_id`, current `status`, and `poll_url` for tracking progress.
    * @throws {AetherError} If filename is empty or chunking config is invalid.
    * @throws {AetherApiError} On non-2xx API response.
@@ -3101,6 +3609,7 @@ export class AetherClient {
       source?: string;
       aclReaders?: string[];
       chunking?: ChunkingConfig;
+      summarize?: boolean;
     },
   ): Promise<{ job_id: string; status: string; poll_url: string }> {
     if (!options.filename) throw new AetherError("filename is required");
@@ -3132,6 +3641,7 @@ export class AetherClient {
     if (options.chunking?.overlap !== undefined) {
       params.set("overlap", options.chunking.overlap.toString());
     }
+    AetherClient.setSummarizeParam(params, options.summarize);
     return this._request<{ job_id: string; status: string; poll_url: string }>(`/documents/async?${params}`, {
       method: "POST",
       body: data as unknown as BodyInit,
@@ -3145,7 +3655,9 @@ export class AetherClient {
    * @param options - Polling options.
    * @param options.timeoutMs - Maximum time to wait in milliseconds. Defaults to `60000` (60 s).
    * @param options.pollIntervalMs - Delay between polls in milliseconds. Defaults to `1000` (1 s).
-   * @returns The final job status, including `doc_id` on success or `error` on failure.
+   * @returns The final job status, including `doc_id` on success or `error` on
+   *   failure, and `summary_state` (`"pending"` / `"skipped"`) when the insert
+   *   requested a summary.
    * @throws {AetherError} If jobId is empty.
    * @throws {AetherApiError} With status 408 if polling times out, or on non-2xx API response.
    * @throws {AetherNetworkError} On connection or timeout failure.
@@ -3153,13 +3665,13 @@ export class AetherClient {
   async waitForJob(
     jobId: string,
     options?: { timeoutMs?: number; pollIntervalMs?: number },
-  ): Promise<{ status: string; doc_id?: string; error?: string }> {
+  ): Promise<JobStatus> {
     if (!jobId) throw new AetherError("jobId is required");
     const timeout = options?.timeoutMs ?? 60000;
     const interval = options?.pollIntervalMs ?? 1000;
     const start = Date.now();
     while (Date.now() - start < timeout) {
-      const job = await this._request<{ status: string; doc_id?: string; error?: string }>(`/documents/jobs/${encodeURIComponent(jobId)}`);
+      const job = await this._request<JobStatus>(`/documents/jobs/${encodeURIComponent(jobId)}`);
       if (job.status === "completed" || job.status === "failed") {
         return job;
       }
@@ -3213,6 +3725,9 @@ export class AetherClient {
    * @param documents - Array of documents to insert, each with `filename`, `content`, and optional `tags` and `entity_id`.
    * @param options - Batch options.
    * @param options.chunking - Chunking configuration applied to all documents in the batch.
+   * @param options.summarize - Request a background summary for every document
+   *   (`true`/`false` overrides the tenant default); an item's own `summarize`
+   *   wins over this.
    * @returns Array of created document records, one per input document.
    * @throws {AetherError} If documents array is empty or chunking config is invalid.
    * @throws {AetherApiError} On non-2xx API response.
@@ -3220,7 +3735,7 @@ export class AetherClient {
    */
   async batchInsert(
     documents: BatchInsertItem[],
-    options?: { chunking?: ChunkingConfig },
+    options?: { chunking?: ChunkingConfig; summarize?: boolean },
   ): Promise<DocumentRecord[]> {
     if (!documents || documents.length === 0) throw new AetherError("documents must be a non-empty array");
     if (options?.chunking?.chunkSize !== undefined && options.chunking.chunkSize < 1) {
@@ -3247,6 +3762,7 @@ export class AetherClient {
       documents: items,
       chunk_size: options?.chunking?.chunkSize,
       overlap: options?.chunking?.overlap,
+      summarize: options?.summarize,
     };
     const res = await this._request<{ results: DocumentRecord[] }>(
       "/documents/batch",
