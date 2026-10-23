@@ -64,7 +64,7 @@
   "author": "Aether Contributors",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/quintessence-group/aether-sdk-typescript.git"
+    "url": "git+https://github.com/Quintessence-Group/aether-sdk-typescript.git"
   },
   "homepage": "https://github.com/quintessence-group/aether-sdk-typescript#readme",
   "bugs": {

@@ -10,6 +10,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: "Existing v<version> tag to publish with the current release workflow"
+        type: string
+        required: true
       authentication:
         description: "Publishing authentication (use token only with a verified release token)"
         type: choice
@@ -27,8 +31,12 @@ jobs:
     permissions:
       contents: read
       id-token: write # required for the npm Trusted Publishing OIDC exchange
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -55,24 +63,21 @@ jobs:
 
       - name: Verify tag matches package.json version
         run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          [[ "$RELEASE_TAG" == v* ]] || { echo "::error::Select an existing v<version> release tag"; exit 1; }
+          test "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")" = "$(git rev-parse HEAD)"
+          TAG_VERSION="${RELEASE_TAG#v}"
           PKG_VERSION=$(node -p "require('./package.json').version")
           if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
             echo "::error::Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
             exit 1
           fi
 
-      # Two supported auth paths, tried in this order:
-      #  1. NPM_TOKEN secret present  -> classic token publish (NO provenance).
-      #     Use this until the npm Trusted Publisher is registered. The token must
-      #     have publish rights on the @aether-ai scope (the same automation token
-      #     already used by aether-plans works — same scope).
-      #  2. No token -> OIDC trusted publishing (preferred; short-lived creds +
-      #     provenance). Requires the Trusted Publisher registered at npmjs.com
-      #     (@aether-ai/sdk -> Settings -> Trusted Publisher ->
-      #       repo: Quintessence-Group/aether-sdk-typescript | workflow: release.yml | environment: prod)
-      #     and npm >= 11.5.1. `id-token: write` above enables the exchange.
-      # Provenance requires the OIDC exchange, so it is only attached on path 2.
+      # Registry provenance compares the repository URL case-sensitively.
+      # Normalize metadata when recovering an immutable tag created before this fix.
+      - name: Match package repository to GitHub provenance
+        run: npm pkg set "repository.url=git+https://github.com/${GITHUB_REPOSITORY}.git"
+
+      # OIDC is the default. A verified token is an explicit manual recovery path.
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ inputs.authentication == 'token' && secrets.NPM_TOKEN || '' }}
@@ -98,7 +103,8 @@ jobs:
         working-directory: /tmp
         run: |
           set -euo pipefail
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          [[ "$RELEASE_TAG" == v* ]] || { echo "::error::Select an existing v<version> release tag"; exit 1; }
+          TAG_VERSION="${RELEASE_TAG#v}"
           mkdir -p /tmp/aether-ts-smoke && cd /tmp/aether-ts-smoke
           npm init -y
           for attempt in 1 2 3 4 5; do
