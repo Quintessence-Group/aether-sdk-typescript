@@ -1,23 +1,20 @@
 name: Release
 
-# Publishes @aether-ai/sdk to npm. Two auth paths (see the Publish step):
-#   1. NPM_TOKEN repo secret set -> classic token publish (no provenance). This
-#      is the working path today; the npm Trusted Publisher (OIDC) has NOT been
-#      registered for this package yet. The @aether-ai-scoped automation token
-#      already stored on aether-plans works here (same scope).
-#   2. No token -> OIDC trusted publishing (preferred once registered): no stored
-#      token, short-lived credentials, provenance attached automatically.
-#
-# Trigger:  git tag v<version> && git push origin v<version>
-#           (the tag must match package.json's "version")
-#
-# Matches the npmjs.com trusted-publishing policy:
-#   package: @aether-ai/sdk · repo: Quintessence-Group/aether-sdk-typescript
-#   workflow: release.yml · environment: prod
+# Publishes @aether-ai/sdk using the existing GitHub trusted publisher.
+# Token authentication is an explicit manual recovery option; a stale token
+# must never silently override the configured OIDC publisher.
+# Run manually against a v<version> tag to retry a corrected trust setup.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      authentication:
+        description: "Publishing authentication (use token only with a verified release token)"
+        type: choice
+        options: [oidc, token]
+        default: oidc
 
 permissions:
   contents: read
@@ -35,7 +32,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: package-lock.json
           registry-url: "https://registry.npmjs.org"
@@ -78,7 +75,7 @@ jobs:
       # Provenance requires the OIDC exchange, so it is only attached on path 2.
       - name: Publish to npm
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ inputs.authentication == 'token' && secrets.NPM_TOKEN || '' }}
         run: |
           set -euo pipefail
           PKG_VERSION=$(node -p "require('./package.json').version")

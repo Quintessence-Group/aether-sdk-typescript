@@ -184,3 +184,116 @@ console.log(`Status: ${result.status} (doc: ${result.doc_id})`);
 ## License
 
 MIT
+
+### Memory files
+
+`memory.files` holds named, versioned **markdown files** for the entity — a
+`memory.md` of agreed terms, a running log, a profile. Agents read them whole, by
+section (heading text or slug) or page by page, and edit them with section-aware
+appends or whole-file writes guarded by the version they read. Every version is
+kept (up to a retention limit) for `versions` and `diff`, and `grep` searches the
+current versions line by line.
+
+```typescript
+import { Memory, VersionConflictError } from "@aether-ai/sdk";
+
+const mem = new Memory("acme", { apiKey: "aether_..." });
+
+// Create the file (fails if it already exists).
+await mem.files.write("memory.md", "# Acme memory\n\n## Agreed terms\n", { create: true });
+
+// Section-aware appends need no precondition: they apply atomically to the
+// current version, and a missing section is created at the end of the file.
+await mem.files.appendSection("memory.md", "Agreed terms", "- Net 30 payment terms");
+await mem.files.append("memory.md", "- 2026-10-10 call notes");
+
+// Read one section, or only the outline.
+const terms = await mem.files.read("memory.md", { section: "Agreed terms" });
+const outline = await mem.files.read("memory.md", { outline: true });
+
+// History, diffs and search.
+const history = await mem.files.versions("memory.md");
+const diff = await mem.files.diff("memory.md"); // previous version → current
+const hits = await mem.files.grep("net\\s+\\d+", { regex: true, ignoreCase: true });
+
+// Erase every version.
+await mem.files.delete("memory.md", { hard: true });
+```
+
+**Read-modify-write.** To rewrite a file, read it, edit the content, and write it
+back with `expectedVersion: file.version`. If someone else wrote in between, the
+write throws `VersionConflictError` (with `currentVersion`): re-read, re-apply
+your edit and write again.
+
+```typescript
+for (;;) {
+  const file = await mem.files.read("memory.md");
+  try {
+    await mem.files.write("memory.md", edit(file.content), { expectedVersion: file.version });
+    break;
+  } catch (err) {
+    if (!(err instanceof VersionConflictError)) throw err;
+  }
+}
+```
+
+- `write` and `replaceSection` take exactly one of `expectedVersion` or
+  `create: true`; `append` and `appendSection` take an optional `expectedVersion`.
+- Every write carries an `Idempotency-Key` that is reused across the SDK's
+  automatic retries, so a retried `append` never appends twice. Pass your own
+  `idempotencyKey` to make your own retries safe too. Writing content identical to
+  the current version is a no-op that returns `unchanged: true`.
+- Names are 1–128 letters, digits, `.`, `_` or `-`, start with a letter or digit,
+  and are case-sensitive; `validateMemoryFileName` checks one client-side.
+- Search hits on a memory file carry `memory_file` (`name`, `version`, `section`).
+- To list or grep across entities — e.g. every company in a workspace — use the raw
+  client: `client.listMemoryFiles({ entityPrefix: "ws_42:company:" })` and
+  `client.grepMemoryFiles("Net 30", { entityPrefix: "ws_42:company:" })`.
+- A `404` with code `feature_not_enabled` means memory files are not enabled on
+  your Aether deployment.
+
+### Reading a document's text
+
+`getText()` returns the parsed, readable text of any stored document — the
+original for text types, the caption or transcript for media, and text rebuilt
+from the parsed passages for PDF/Office — paged and addressable by section:
+
+```typescript
+const outline = await aether.getText(docId, { outline: true });
+console.log(outline.sections?.map((s) => s.heading));
+
+const terms = await aether.getText(docId, { section: "Payment terms" });
+let page = await aether.getText(docId, { maxBytes: 65536 });
+while (page.truncated) {
+  page = await aether.getText(docId, { offset: page.next_offset!, maxBytes: 65536 });
+}
+```
+
+### Document summaries
+
+Ask for a short markdown summary when you insert a document; it is generated in the
+background after the document is stored and never delays or fails the insert:
+
+```typescript
+const doc = await aether.insert(pdfBytes, { filename: "msa.pdf", summarize: true });
+console.log(doc.summary); // "pending" (or "skipped" by policy)
+
+const summary = await aether.getSummary(doc.doc_id);
+if (summary.state === "ready") console.log(summary.content);
+
+// Write your own (it is kept until a forced regeneration), or regenerate.
+await aether.putSummary(doc.doc_id, "## Summary\n- Master services agreement.\n", {
+  expectedRevision: summary.revision ?? undefined,
+});
+await aether.regenerateSummary(doc.doc_id, { force: true });
+```
+
+`summarize` is accepted by `insert`, `insertText`, `insertStream`, `insertAsync`
+(the job status reports `summary_state`), `batchInsert` (batch-wide and per item)
+and `Memory` (`new Memory(id, { summarize: true })` or per call in `remember`).
+Omit it to follow your tenant's default. `getSummary` always answers with a `state`
+(`none`, `pending`, `ready`, `failed`, `skipped` or `unsupported`); `stale: true`
+means the document changed after the summary was written. A `404` with code
+`feature_not_enabled` means summaries are not enabled on your deployment.
+
+For complete RAG examples with Anthropic, OpenAI, Vercel AI SDK, and more, see [examples/](../../examples/).

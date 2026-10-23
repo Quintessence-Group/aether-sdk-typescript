@@ -2,10 +2,12 @@ export {
   AetherClient,
   INGEST_CONTENT_TYPES,
   resolveContentType,
+  validateMemoryFileName,
   verifyConnectRedirectSignature,
 } from "./client.js";
 export type { AetherClientOptions } from "./client.js";
 export { Memory, Thread } from "./memory.js";
+export { MemoryFiles } from "./memory-files.js";
 export type {
   MemoryItem,
   MediaSource,
@@ -38,6 +40,7 @@ export {
   PrincipalPinMismatchError,
   SessionInvalidError,
   PartitionMismatchError,
+  VersionConflictError,
   aetherApiErrorFromResponse,
 } from "./errors.js";
 export type { AetherErrorBody } from "./errors.js";
@@ -91,6 +94,37 @@ export type {
   ConnectionPurgeReceipt,
   ConnectionBrowseEntry,
   ConnectionBrowsePage,
+  DocumentText,
+  GetTextOptions,
+  MemoryFileSection,
+  MemoryFileOp,
+  MemoryFileInfo,
+  MemoryFile,
+  MemoryFileWriteResult,
+  MemoryFileVersion,
+  MemoryFileVersions,
+  MemoryFileDiff,
+  MemoryFilePage,
+  MemoryGrepMatch,
+  MemoryGrepResult,
+  MemoryFileDeleteResult,
+  MemoryFileHit,
+  MemoryFileListOptions,
+  ListMemoryFilesOptions,
+  MemoryFileReadOptions,
+  MemoryFileWriteCommonOptions,
+  MemoryFileWriteOptions,
+  MemoryFileAppendOptions,
+  MemoryFileAppendSectionOptions,
+  MemoryFileReplaceSectionOptions,
+  MemoryFileVersionsOptions,
+  MemoryFileDiffOptions,
+  MemoryFileGrepOptions,
+  GrepMemoryFilesOptions,
+  MemoryFileDeleteOptions,
+  DocumentSummary,
+  DocumentSummaryState,
+  JobStatus,
 } from "./models.js";
 export { formatContext, DEFAULT_TEMPLATE } from "./rag.js";
 export type { FormatContextOptions, FormatContextResult } from "./rag.js";
